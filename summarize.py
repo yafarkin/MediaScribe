@@ -82,13 +82,16 @@ def build_messages(prompt, source_excerpt, language, material, stage):
         f"<source_material>\n{material}\n</source_material>")}]
 
 
-def summarize(text, language, prompt, args, checkpoint, progress=None):
+def summarize(text, language, prompt, args, checkpoint, progress=None, on_event=None, on_plan=None):
     records = []
     excerpt = text[:1200]
     def generate(material, stage):
+        if on_event:
+            on_event({"type": "stage.start", "stage": stage})
         result = chat(args.lm_url, args.model,
                       build_messages(prompt, excerpt, language, material, stage),
-                      max_tokens=args.max_tokens, timeout=args.timeout, reasoning=args.reasoning)
+                      max_tokens=args.max_tokens, timeout=args.timeout, reasoning=args.reasoning,
+                      on_event=on_event)
         records.append({"stage": stage, "text": result})
         # Preserve successful parts even if a later request fails.
         write_json(checkpoint, {"model": args.model, "language": language,
@@ -97,17 +100,57 @@ def summarize(text, language, prompt, args, checkpoint, progress=None):
             progress()
         return result
     parts = split_text(text, args.chunk_chars)
+    if on_plan:
+        on_plan(1 if len(parts) == 1 else len(parts) + 1)
     if len(parts) == 1:
         return generate(text, "final")
     notes = "\n\n".join(generate(part, "part") for part in parts)
     for _ in range(8):
         if len(notes) <= args.chunk_chars:
             return generate(notes, "final")
-        reduced = "\n\n".join(generate(part, "reduce") for part in split_text(notes, args.chunk_chars))
+        reduction_parts = split_text(notes, args.chunk_chars)
+        if on_plan:
+            on_plan(len(records) + len(reduction_parts) + 1)
+        reduced = "\n\n".join(generate(part, "reduce") for part in reduction_parts)
         if len(reduced) >= len(notes):
             raise RuntimeError("Модель не сокращает промежуточные заметки. Измените промпт или увеличьте --chunk-chars. Части сохранены.")
         notes = reduced
     raise RuntimeError("Достигнут лимит этапов объединения. Промежуточные заметки сохранены.")
+
+
+class SummaryProgress:
+    """Stage percentage plus live server events; no invented token percentage."""
+    def __enter__(self):
+        from tqdm import tqdm
+        self.overall = tqdm(total=1, desc="Конспект", unit="этап", dynamic_ncols=True, position=0)
+        self.current = tqdm(desc="Ожидание LM Studio", unit="симв", dynamic_ncols=True, position=1, leave=False)
+        return self
+
+    def plan(self, total):
+        self.overall.total = total
+        self.overall.refresh()
+
+    def complete(self):
+        self.overall.update(1)
+
+    def event(self, event):
+        kind = event["type"]
+        if kind == "stage.start":
+            self.current.reset()
+            self.current.set_description({"part": "Заметки по части", "reduce": "Объединение заметок", "final": "Итоговый конспект"}[event["stage"]])
+        elif kind in {"model_load.start", "prompt_processing.start"}:
+            self.current.set_description("Загрузка модели" if kind.startswith("model_load") else "Чтение запроса")
+        elif kind in {"model_load.progress", "prompt_processing.progress"}:
+            label = "Загрузка модели" if kind.startswith("model_load") else "Чтение запроса"
+            self.current.set_description(f"{label} {event['progress']:.0%}")
+        elif kind in {"message.start", "reasoning.start"}:
+            self.current.set_description("Генерация текста" if kind.startswith("message") else "Thinking")
+        elif kind in {"message.delta", "reasoning.delta"}:
+            self.current.update(len(event.get("content", "")))
+
+    def __exit__(self, *exc):
+        self.current.close()
+        self.overall.close()
 
 
 def parser():
@@ -153,11 +196,11 @@ def main():
     if not args.force and (output.exists() or checkpoint.exists()):
         p.error(f"Результат уже существует: {output} или {checkpoint}. Задайте --output либо --force")
     output.parent.mkdir(parents=True, exist_ok=True)
-    from tqdm import tqdm
     parts_count = len(split_text(text, args.chunk_chars))
     print(f"Частей исходника: {parts_count}. Язык: {language or 'как в исходном тексте'}.")
-    with tqdm(desc="Конспект, запросы", unit="запрос", dynamic_ncols=True) as bar:
-        result = summarize(text, language, prompt, args, checkpoint, lambda: bar.update(1))
+    with SummaryProgress() as progress:
+        result = summarize(text, language, prompt, args, checkpoint,
+                           progress.complete, progress.event, progress.plan)
     temporary = output.with_suffix(output.suffix + ".tmp")
     temporary.write_text(result + "\n", encoding="utf-8")
     temporary.replace(output)

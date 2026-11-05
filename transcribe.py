@@ -115,6 +115,10 @@ def preflight(args):
             raise RuntimeError(f"Нет локальной модели {model}. Сначала запустите python prepare.py.")
     if args.slides:
         requirements.append("cv2")
+    if args.pptx:
+        requirements.append("pptx")
+    if args.pdf:
+        requirements.append("reportlab")
     if args.speakers:
         requirements.append("pyannote")
         if not Path(args.speaker_model or ROOT / "models" / "speakers").is_dir():
@@ -357,34 +361,64 @@ def markdown(title, utterance_list, slides, mode=None, timestamps="segment", par
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Локальная транскрипция аудио/видео в Markdown.")
-    p.add_argument("file", type=Path)
+    p = argparse.ArgumentParser(description="MediaScribe: локальная транскрипция аудио/видео, конспект, PowerPoint, PDF и Obsidian.",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("file", type=Path, help="Исходный аудио- или видеофайл")
     p.add_argument("--output-root", type=Path, help="Родительская папка результата; по умолчанию рядом с исходником")
-    p.add_argument("--language", choices=["ru", "en", "auto"], default="ru")
+    p.add_argument("--language", choices=["ru", "en", "auto"], default="ru", help="Язык распознавания; auto определяет язык автоматически")
     p.add_argument("--model", type=Path, help="Папка локальной модели Whisper")
     p.add_argument("--prompt", default="", help="Термины и имена для Whisper, без изменения расшифровки моделью LLM")
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu", help="Для faster-whisper и pyannote; MLX всегда использует Metal")
-    p.add_argument("--speakers", action="store_true")
-    p.add_argument("--num-speakers", type=int)
-    p.add_argument("--speaker-model", type=Path)
-    p.add_argument("--slides", action="store_true")
-    p.add_argument("--slides-mode", choices=["heuristic", "vision"], default="heuristic")
+    p.add_argument("--speakers", action="store_true", help="Определять нескольких говорящих через локальную pyannote")
+    p.add_argument("--num-speakers", type=int, help="Известное число говорящих; требует --speakers")
+    p.add_argument("--speaker-model", type=Path, help="Папка локальной модели pyannote")
+    p.add_argument("--slides", action="store_true", help="Найти и сохранить кадры со слайдами")
+    p.add_argument("--pptx", action="store_true", help="Собрать <имя видео>.pptx с речью в заметках; для нового запуска включает --slides")
+    p.add_argument("--pdf", action="store_true", help="Собрать <имя видео>.pdf: слайды и речь; для нового запуска включает --slides")
+    p.add_argument("--pdf-font-file", type=Path, help="TTF-шрифт для PDF; по умолчанию локальный Arial или DejaVu Sans")
+    p.add_argument("--obsidian", action="store_true", help="Собрать папку obsidian с summary.md, presentation.md и кадрами")
+    p.add_argument("--slides-mode", choices=["heuristic", "vision"], default="heuristic", help="Отбор по геометрии либо дополнительная проверка через LM Studio")
     p.add_argument("--vision-model", help="Идентификатор модели с поддержкой изображений в LM Studio")
-    p.add_argument("--lm-url", default="http://127.0.0.1:1234/v1")
-    p.add_argument("--sample-interval", type=float, default=1.0)
-    p.add_argument("--scene-threshold", type=float, default=0.06)
-    p.add_argument("--settle", type=float, default=1.5)
+    p.add_argument("--lm-url", default="http://127.0.0.1:1234/v1", help="Локальный адрес LM Studio для слайдов и конспекта")
+    p.add_argument("--sample-interval", type=float, default=1.0, help="Интервал проверки кадров, секунды")
+    p.add_argument("--scene-threshold", type=float, default=0.06, help="Порог изменения кадра от 0 до 1; меньше означает больше кандидатов")
+    p.add_argument("--settle", type=float, default=1.5, help="Ожидание стабильного кадра после изменения, секунды")
     p.add_argument("--reuse-transcript", action="store_true", help="Использовать raw-transcript.json вместо повторного распознавания")
     p.add_argument("--timestamps", choices=["segment", "start", "paragraph", "interval", "none"], default="segment",
                    help="Формат таймкодов Markdown; JSON всегда содержит исходное время")
     p.add_argument("--paragraph-seconds", type=float, default=45, help="Максимальная длительность объединённого абзаца")
     p.add_argument("--timestamp-interval", type=float, default=60, help="Минимальный интервал отметок для --timestamps interval")
+    p.add_argument("--summarize", action="store_true", help="После транскрипции создать summary.md через локальную LM Studio")
+    p.add_argument("--summary-model", help="Идентификатор текстовой модели LM Studio")
+    p.add_argument("--summary-prompt-file", type=Path, default=ROOT / "summary-prompt.md", help="Файл промпта конспектатора")
+    p.add_argument("--summary-chunk-chars", type=int, default=10000, help="Размер части транскрипции для конспекта, символы")
+    p.add_argument("--summary-max-tokens", type=int, default=4096, help="Лимит ответа модели на каждом этапе конспекта")
+    p.add_argument("--summary-timeout", type=float, default=600, help="Таймаут ожидания данных LM Studio, секунды")
+    p.add_argument("--summary-reasoning", choices=["off", "auto"], default="off", help="Отключить thinking либо использовать настройку модели")
     return p
 
 
 def main():
     p = parser()
+    if len(sys.argv) == 1:
+        p.print_help()
+        return
     args = p.parse_args()
+    if args.summarize:
+        if not args.summary_model:
+            p.error("Для --summarize укажите --summary-model")
+        if args.summary_chunk_chars < 1000 or args.summary_max_tokens < 1 or args.summary_timeout <= 0:
+            p.error("Нужны summary-chunk-chars >= 1000, summary-max-tokens > 0 и summary-timeout > 0")
+        args.summary_prompt_file = args.summary_prompt_file.expanduser().resolve()
+        if not args.summary_prompt_file.is_file() or not args.summary_prompt_file.read_text(encoding="utf-8-sig").strip():
+            p.error("Файл промпта конспекта не найден или пуст")
+        local_endpoint(args.lm_url)
+    exports_requested = args.pptx or args.pdf or args.obsidian
+    if exports_requested and not args.reuse_transcript:
+        args.slides = True
+    if args.pdf:
+        from export_pdf import find_font
+        find_font(args.pdf_font_file)
     if args.paragraph_seconds <= 0 or args.timestamp_interval <= 0:
         p.error("paragraph-seconds и timestamp-interval должны быть положительными")
     if args.sample_interval <= 0 or args.settle < 0 or not 0 < args.scene_threshold < 1:
@@ -411,6 +445,7 @@ def main():
     raw = None
     cached_turns = None
     cached_slides = []
+    cached_summary = None
     if args.reuse_transcript:
         raw = json.loads(cached.read_text(encoding="utf-8"))
         if raw.get("source") != fingerprint:
@@ -423,12 +458,18 @@ def main():
                 relative = Path(slide["path"])
                 if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("slides",):
                     raise RuntimeError("Некорректный путь кадра в slides.json")
+        if args.obsidian and not args.summarize and (destination / "summary.md").is_file():
+            cached_summary = (destination / "summary.md").read_text(encoding="utf-8-sig")
         # Put each re-render in its own folder, preserving earlier slides and text.
         parent = destination / "runs"
         parent.mkdir(exist_ok=True)
         from datetime import datetime
         destination = parent / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    if exports_requested and not args.slides and not cached_slides:
+        p.error("Для экспорта нужны сохранённые слайды либо --slides для нового отбора")
     destination.mkdir(parents=True, exist_ok=False)
+    if cached_summary is not None:
+        (destination / "summary.md").write_text(cached_summary, encoding="utf-8")
     if cached_slides:
         for slide in cached_slides:
             target = destination / slide["path"]
@@ -450,6 +491,9 @@ def main():
             print("Распознавание речи…", flush=True)
             raw = recognize(wav, args)
             raw["source"] = fingerprint
+        duration = info.get("format", {}).get("duration")
+        if duration is not None:
+            raw["duration"] = float(duration)
         write_json(destination / "raw-transcript.json", raw)
         turns = diarize(wav, args) if args.speakers else cached_turns
         if turns is not None:
@@ -463,7 +507,28 @@ def main():
         gc.collect()
         slides = extract_slides(source, destination, raw["segments"], args) if args.slides else cached_slides
         transcript.write_text(markdown(source.stem, spoken, slides, args.slides_mode if args.slides else None, **rendering), encoding="utf-8")
-    print(f"Готово: {transcript}")
+    print(f"Готово: {transcript}", flush=True)
+    if args.pptx:
+        from export_pptx import export_deck
+        export_deck(destination)
+    if args.pdf:
+        from export_pdf import export_pdf
+        export_pdf(destination, font_file=args.pdf_font_file)
+    if args.summarize:
+        # A child process retains the CLI's live streaming progress and exit code.
+        command = [sys.executable, str(ROOT / "summarize.py"), str(transcript),
+                   "--model", args.summary_model, "--lm-url", args.lm_url,
+                   "--prompt-file", str(args.summary_prompt_file),
+                   "--chunk-chars", str(args.summary_chunk_chars),
+                   "--max-tokens", str(args.summary_max_tokens),
+                   "--timeout", str(args.summary_timeout),
+                   "--reasoning", args.summary_reasoning]
+        result = subprocess.run(command)
+        if result.returncode:
+            raise RuntimeError(f"Конспектатор завершился с кодом {result.returncode}. Транскрипция сохранена: {transcript}")
+    if args.obsidian:
+        from export_obsidian import export_obsidian
+        export_obsidian(destination)
 
 
 if __name__ == "__main__":

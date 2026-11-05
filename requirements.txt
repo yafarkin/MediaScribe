@@ -3,3 +3,5 @@ faster-whisper>=1.1,<2; sys_platform != 'darwin' or platform_machine != 'arm64'
 opencv-python-headless>=4.10,<5
 huggingface-hub>=0.27,<2
 tqdm>=4.66,<5
+python-pptx>=1.0,<2
+reportlab>=4.2,<5

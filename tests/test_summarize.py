@@ -1,5 +1,6 @@
 import argparse
 import json
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,30 @@ import summarize as app
 
 
 class SummaryTests(unittest.TestCase):
+    def test_stream_progress_and_final_result(self):
+        events = [{"type": "prompt_processing.progress", "progress": 0.5},
+                  {"type": "message.delta", "content": "Конспект"},
+                  {"type": "chat.end", "result": {"output": [
+                      {"type": "message", "content": "Конспект"}], "stats": {"total_output_tokens": 4}}}]
+        stream = "\n\n".join("event: " + e["type"] + "\ndata: " + json.dumps(e, ensure_ascii=False) for e in events) + "\n\n"
+        seen = []
+        with patch.object(lmstudio, "open_response", return_value=io.BytesIO(stream.encode())):
+            text = lmstudio.chat("http://127.0.0.1:1234/v1", "test", [], on_event=seen.append)
+        self.assertEqual(text, "Конспект")
+        self.assertEqual(seen, events)
+
+    def test_stream_without_final_event_is_an_error(self):
+        stream = b'event: message.delta\ndata: {"content": "partial"}\n\n'
+        with patch.object(lmstudio, "open_response", return_value=io.BytesIO(stream)):
+            with self.assertRaisesRegex(RuntimeError, "прерван"):
+                lmstudio.chat("http://127.0.0.1:1234/v1", "test", [], on_event=lambda e: None)
+
+    def test_stream_error_is_not_saved_as_successful_completion(self):
+        stream = b'event: error\ndata: {"error": {"message": "Model unloaded"}}\n\n'
+        with patch.object(lmstudio, "open_response", return_value=io.BytesIO(stream)):
+            with self.assertRaisesRegex(RuntimeError, "Model unloaded"):
+                lmstudio.chat("http://127.0.0.1:1234/v1", "test", [], on_event=lambda e: None)
+
     def test_chunking_preserves_all_characters_and_bounds_requests(self):
         text = ("Определение.\n\nПример с объяснением. " * 500) + "x" * 4000
         chunks = app.split_text(text, 1000)

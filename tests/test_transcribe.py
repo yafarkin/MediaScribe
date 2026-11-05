@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 import io
@@ -12,6 +13,27 @@ import transcribe as app
 
 
 class TranscriptTests(unittest.TestCase):
+    def test_summary_child_runs_after_transcript_and_inherits_progress_output(self):
+        native_run = subprocess.run
+        child_calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "lecture.wav"
+            native_run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=1", str(source)], check=True)
+            def run(command, *args, **kwargs):
+                if len(command) > 1 and command[1] == str(app.ROOT / "summarize.py"):
+                    self.assertTrue(Path(command[2]).is_file())
+                    self.assertNotIn("capture_output", kwargs)
+                    child_calls.append(command)
+                    return subprocess.CompletedProcess(command, 0)
+                return native_run(command, *args, **kwargs)
+            raw = {"segments": [{"start": 0, "end": 1, "text": "Тест.", "words": []}]}
+            with patch("sys.argv", ["transcribe.py", str(source), "--summarize", "--summary-model", "Local Model", "--summary-chunk-chars", "6000"]), patch.object(app, "preflight"), patch.object(app, "recognize", return_value=raw), patch.object(app.subprocess, "run", run):
+                app.main()
+            self.assertEqual(len(child_calls), 1)
+            self.assertEqual(child_calls[0][0], sys.executable)
+            self.assertIn("Local Model", child_calls[0])
+            self.assertIn("6000", child_calls[0])
+
     def test_speaker_change_splits_whisper_segment_at_word(self):
         segments = [{"start": 0, "end": 4, "text": "Привет. Да.", "words": [
             {"start": 0, "end": 1, "word": " Привет."},
