@@ -71,6 +71,18 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(len(app.paragraphs(speech, [], 45)), 3)
         self.assertEqual(" ".join(s["text"] for s in app.paragraphs(speech, [], 3)), "0 1 2 3 4")
 
+    def test_speaker_labels_appear_only_at_start_changes_and_new_slides(self):
+        speech = [{"start": i * 2, "end": i * 2 + 2, "speaker": speaker, "text": f"Фраза {i}."}
+                  for i, speaker in enumerate(["Спикер 1", "Спикер 1", "Спикер 2", "Спикер 2", "Спикер 1", "Спикер 1"])]
+        for mode in ["segment", "start", "paragraph", "interval", "none"]:
+            text = app.markdown("Test", speech, [], timestamps=mode)
+            self.assertEqual(text.count("Спикер 1:"), 2, mode)
+            self.assertEqual(text.count("Спикер 2:"), 1, mode)
+            for i in range(6):
+                self.assertIn(f"Фраза {i}.", text)
+        text = app.markdown("Test", speech, [{"time": 10, "path": "slides/a.jpg"}])
+        self.assertEqual(text.count("Спикер 1:"), 3)
+
     def test_timestamp_modes_and_none_hides_slide_times(self):
         speech = [{"start": i * 20, "end": i * 20 + 20, "speaker": "Спикер 1", "text": f"Фраза {i}."} for i in range(4)]
         slides = [{"time": 5, "path": "slides/a.jpg"}]

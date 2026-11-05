@@ -14,6 +14,8 @@ from pypdf import PdfReader
 
 from export_obsidian import export_obsidian
 from export_pdf import export_pdf
+from export_pptx import export_deck
+from pptx import Presentation
 import transcribe
 
 
@@ -54,6 +56,30 @@ class ExportTests(unittest.TestCase):
             self.assertIn("Слайдов: 1", (target / "summary.md").read_text())
             with self.assertRaises(FileExistsError):
                 export_obsidian(folder)
+
+    def test_all_exports_label_only_speaker_changes_and_reset_on_new_slide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            self.fixture(folder)
+            (folder / "slides.json").write_text(json.dumps([
+                {"time": 0, "path": "slides/кадр 01.jpg"}, {"time": 10, "path": "slides/кадр 01.jpg"}]))
+            speech = [{"start": i * 2, "end": i * 2 + 2, "speaker": speaker, "text": f"Фраза {i}."}
+                      for i, speaker in enumerate(["Спикер 1", "Спикер 1", "Спикер 2", "Спикер 2", "Спикер 1", "Спикер 1"])]
+            (folder / "transcript.json").write_text(json.dumps(speech))
+            deck = Presentation(export_deck(folder))
+            first = deck.slides[0].notes_slide.notes_text_frame.text
+            second = deck.slides[1].notes_slide.notes_text_frame.text
+            self.assertEqual(first.count("Спикер 1:"), 2)
+            self.assertEqual(second.count("Спикер 1:"), 1)
+            obsidian = export_obsidian(folder)
+            markdown = (obsidian / "presentation.md").read_text()
+            pdf = PdfReader(export_pdf(folder))
+            pdf_text = "\n".join(p.extract_text() for p in pdf.pages)
+            for text in [first + second, markdown.replace("**", ""), pdf_text]:
+                self.assertEqual(text.count("Спикер 1:"), 3)
+                self.assertEqual(text.count("Спикер 2:"), 1)
+                for i in range(6):
+                    self.assertIn(f"Фраза {i}.", text)
 
     def test_pdf_embeds_cyrillic_and_paginates_long_speech_without_losing_end(self):
         with tempfile.TemporaryDirectory() as tmp:

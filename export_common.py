@@ -41,7 +41,15 @@ class Lecture:
 
     def notes(self, index):
         return self.period(index) + "\n\n" + "\n\n".join(
-            f"{s.get('speaker', 'Спикер 1')}: {s['text'].strip()}" for s in self.groups[index])
+            (f"{speaker}: " if speaker else "") + text for speaker, text in self.replicas(index))
+
+    def replicas(self, index):
+        """Label the first speaker and each change, resetting for each slide."""
+        previous = None
+        for segment in self.groups[index]:
+            speaker = segment.get("speaker", "Спикер 1")
+            yield (speaker if speaker != previous else None), segment["text"].strip()
+            previous = speaker
 
 
 def load_lecture(folder):

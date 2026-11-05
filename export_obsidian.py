@@ -34,9 +34,9 @@ def export_obsidian(folder, output=None):
             label = ("Slide" if en else "Слайд") + f" {index + 1}"
             presentation += [f"## {label}", "", lecture.period(index), "",
                              f"![{label}]({quote(relative.as_posix())})", ""]
-            for segment in lecture.groups[index]:
-                presentation += [f"**{markdown_escape(segment.get('speaker', 'Спикер 1'))}:** "
-                                 + markdown_escape(segment["text"].strip()), ""]
+            for speaker, text in lecture.replicas(index):
+                prefix = f"**{markdown_escape(speaker)}:** " if speaker else ""
+                presentation += [prefix + markdown_escape(text), ""]
         (staging / "presentation.md").write_text("\n".join(presentation), encoding="utf-8")
         metadata = ("---\n" + "title: " + json.dumps(lecture.title, ensure_ascii=False) + "\n"
                     + "source: " + json.dumps(lecture.source_name, ensure_ascii=False) + "\n"

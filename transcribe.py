@@ -341,10 +341,12 @@ def markdown(title, utterance_list, slides, mode=None, timestamps="segment", par
         utterance_list = paragraphs(utterance_list, slides, paragraph_seconds)
     events = [(s["start"], 1, s) for s in utterance_list] + [(s["time"], 0, s) for s in slides]
     last_timestamp = None
+    previous_speaker = None
     for time, kind, item in sorted(events, key=lambda e: (e[0], e[1])):
         if kind == 0:
             prefix = f"{stamp(time)} · " if timestamps != "none" else ""
             lines += [f"[{prefix}Слайд {Path(item['path']).stem.split('_')[0]}]({quote(item['path'])})", ""]
+            previous_speaker = None
         else:
             text = item["text"].replace("\n", " ")
             # Preserve literal speech, including punctuation that Markdown interprets.
@@ -356,7 +358,12 @@ def markdown(title, utterance_list, slides, mode=None, timestamps="segment", par
             elif timestamps == "start" or (timestamps == "interval" and (last_timestamp is None or time - last_timestamp >= timestamp_interval)):
                 timing = f"[{stamp(time)}] "
                 last_timestamp = time
-            lines += [f"**{timing}{item['speaker']}:** {text}", ""]
+            speaker = item["speaker"]
+            label = f"{speaker}:" if speaker != previous_speaker else ""
+            heading = (timing + label).strip()
+            prefix = f"**{heading}** " if heading else ""
+            lines += [prefix + text, ""]
+            previous_speaker = speaker
     return "\n".join(lines)
 
 

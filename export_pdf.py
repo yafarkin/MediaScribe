@@ -63,10 +63,10 @@ def export_pdf(folder, output=None, force=False, font_file=None):
             image_width, image_height = bitmap.size
         scale = min(available_width / image_width, 300 / image_height)
         story += [Image(str(image), width=image_width * scale, height=image_height * scale), Spacer(1, 16)]
-        for segment in lecture.groups[index]:
-            speaker = escape(segment.get("speaker", "Спикер 1"))
-            text = escape(segment["text"].strip()).replace("\n", "<br/>")
-            story.append(Paragraph(f"{speaker}: {text}", body))
+        for speaker, text in lecture.replicas(index):
+            prefix = escape(speaker) + ": " if speaker else ""
+            text = escape(text).replace("\n", "<br/>")
+            story.append(Paragraph(prefix + text, body))
     def page_chrome(canvas, doc):
         canvas.saveState()
         canvas.setFillColor(colors.white)
