@@ -4,15 +4,25 @@ MediaScribe превращает аудио и видео в транскрип�
 
 `transcribe.py` распознаёт речь через Whisper large-v3. На Apple Silicon используется MLX и Metal, на других системах используется faster-whisper. `summarize.py` анализирует готовую транскрипцию через локальную LM Studio. Скрипты `export_pptx.py`, `export_pdf.py` и `export_obsidian.py` формируют документы из уже подготовленного результата. `prepare.py` скачивает модели распознавания для последующей работы без сети.
 
-Обработка выполняется локально. Интернет нужен при установке зависимостей и скачивании моделей через `prepare.py`. В `transcribe.py` включён режим Hugging Face offline, отключена телеметрия Hugging Face и pyannote. Для анализа слайдов через LM Studio разрешён только числовой loopback-адрес. Перенаправления HTTP и системные прокси отключены.
+Обработка выполняется локально. Интернет нужен для установки зависимостей и первоначального скачивания моделей. `prepare.py` скачивает Whisper и, по запросу, модель разделения голосов. Модели для конспекта и анализа изображений нужно отдельно скачать в LM Studio. После подготовки обработку можно выполнять без интернета. В `transcribe.py` включён режим Hugging Face offline, отключена телеметрия Hugging Face и pyannote. Запросы к LM Studio разрешены только на числовой loopback-адрес. Перенаправления HTTP и системные прокси отключены.
 
-## Установка на этом Mac
+## Получение проекта
 
-FFmpeg уже установлен. Если устанавливать на другой Mac, сначала выполните `brew install ffmpeg`.
-
-Используйте Python 3.11 или 3.12. Из папки проекта выполните:
+Нужны Git, Python 3.11 или 3.12 и FFmpeg. LM Studio требуется только для конспекта и проверки слайдов нейросетью. Распознавание речи, простой отбор кадров и экспорты работают без неё.
 
 ```bash
+git clone https://github.com/yafarkin/MediaScribe.git
+cd MediaScribe
+```
+
+На Apple Silicon выбирается MLX с ускорением Metal. На Windows и других платформах выбирается faster-whisper; по умолчанию он работает на CPU. На практике проверена macOS на Apple Silicon. Windows и CUDA требуют отдельной проверки на соответствующей машине.
+
+## Установка на macOS с Apple Silicon
+
+Установите FFmpeg через Homebrew, затем создайте окружение Python и скачайте модель распознавания:
+
+```bash
+brew install ffmpeg
 python3 -m venv .venv
 source .venv/bin/activate
 python -m ensurepip --upgrade
@@ -20,7 +30,9 @@ python -m pip install -r requirements.txt
 python prepare.py
 ```
 
-`prepare.py` скачивает модель в `models/whisper-mlx`. Нужно несколько гигабайт свободного места. После скачивания можно отключить интернет. Не удаляйте файлы модели.
+Убедитесь, что `python3` запускает Python 3.11 или 3.12. `prepare.py` скачивает модель в `models/whisper-mlx`; для Whisper large-v3 нужно около 3 ГБ свободного места, дополнительно требуется место под зависимости и результаты. Не удаляйте файлы модели, если планируете работать без сети.
+
+При обновлении существующей установки активируйте окружение и выполните `python -m pip install -r requirements.txt`. Дополнительные зависимости для голосов и проверок устанавливаются отдельно, как описано ниже.
 
 ## Запуск
 
@@ -51,8 +63,8 @@ python transcribe.py "/путь/Лекция 01.mp4"
     slides.json
     slide-decisions.json
     speakers.json           # если указан --speakers
-    Лекция 01.pptx          # если указан --pptx
-    Лекция 01.pdf           # если указан --pdf
+    Лекция 01.pptx           # если указан --pptx
+    Лекция 01.pdf            # если указан --pdf
     summary.md              # если указан --summarize
     summary.parts.json
     obsidian/               # если указан --obsidian
@@ -114,7 +126,7 @@ python transcribe.py "/путь/Лекция 01.mp4" --reuse-transcript \
 
 | Режим | Пример | Поведение |
 | --- | --- | --- |
-| `segment` | `--timestamps segment` | Начало и конец каждого сегмента распознавания, как в первоначальной версии. Выбран по умолчанию. |
+| `segment` | `--timestamps segment` | Начало и конец каждого сегмента распознавания. Выбран по умолчанию. |
 | `start` | `--timestamps start` | Только начало каждого сегмента. |
 | `paragraph` | `--timestamps paragraph` | Соседние сегменты объединяются в абзацы, время указано у каждого абзаца. |
 | `interval` | `--timestamps interval --timestamp-interval 60` | Абзацы с периодическими отметками начала. Отметка ставится у первого абзаца, затем не чаще выбранного интервала. |
@@ -286,7 +298,7 @@ python summarize.py "/путь/Лекция 01/transcript.md" \
 
 ## Несколько голосов
 
-Для текущих лекций с одним голосом `--speakers` не нужен. Для записей с несколькими людьми установите дополнительный пакет:
+Для записей с одним голосом `--speakers` не нужен. Для нескольких говорящих установите дополнительные зависимости:
 
 ```bash
 python -m pip install -r requirements-speakers.txt
@@ -301,9 +313,21 @@ python transcribe.py "/путь/Обсуждение.mp4" --speakers
 
 Если число участников известно, добавьте `--num-speakers 2`. На Mac pyannote выполняется на CPU. Метки `Спикер 1`, `Спикер 2` действуют в пределах одной записи. Одновременная речь и короткие реплики могут распознаваться неверно. Используется exclusive diarization: каждой части текста назначается один говорящий, разделение одновременно звучащих голосов не выполняется. Если перекрытия с найденным голосом нет, ставится метка `Спикер не определён`.
 
-## Windows
+## Установка на Windows
 
-Исходный Python-код общий, но окружение нужно установить отдельно. Нужны Python 3.11/3.12, FFmpeg в `PATH` и пакеты из `requirements.txt`. Там автоматически выбирается faster-whisper вместо MLX. Выполните `python prepare.py` на Windows для скачивания соответствующего формата модели. Активация окружения в PowerShell: `.venv\Scripts\Activate.ps1`.
+Установите Python 3.11 или 3.12 и FFmpeg. Команды `ffmpeg -version` и `ffprobe -version` должны работать в PowerShell. После клонирования проекта из его папки выполните:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe prepare.py
+.\.venv\Scripts\python.exe transcribe.py "C:\Записи\Лекция 01.mp4"
+```
+
+Активация окружения необязательна, если вы вызываете его `python.exe` напрямую. При необходимости его можно активировать командой `.\.venv\Scripts\Activate.ps1`. Остальные команды из README выполняются так же, с заменой `python` на `.\.venv\Scripts\python.exe`.
+
+Окружение и модель нужно установить отдельно на каждой машине. На Windows `requirements.txt` выбирает faster-whisper вместо MLX, а `prepare.py` скачивает модель в `models/whisper-faster`. Копировать папку `models/whisper-mlx` с Mac для этого движка не нужно.
 
 На CPU скрипт работает с параметрами по умолчанию. Для RTX 4070 используйте `--device cuda`; дополнительно нужны совместимые библиотеки CUDA/cuDNN согласно [инструкции faster-whisper](https://github.com/SYSTRAN/faster-whisper#gpu). Windows и CUDA в этой рабочей среде не проверялись.
 
@@ -321,3 +345,7 @@ python -m unittest discover -s tests -v
 В Git входят Python-скрипты, промпт, зависимости, инструкция и проверки. Окружение `.venv`, скачанные модели `models/` и `model/`, кэш, папки `video/`, `videos/`, `audio/`, `audios/`, `output/`, `obsidian/`, файлы `.pptx`, `.pdf` и распространённые форматы медиа исключены через `.gitignore`. Складывайте исходные записи и результаты в эти папки либо вне проекта, чтобы они не попадали в коммиты.
 
 API сверены с [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper), [pyannote Community-1](https://huggingface.co/pyannote/speaker-diarization-community-1), [совместимым API LM Studio](https://lmstudio.ai/docs/developer/openai-compat) и [нативным API LM Studio](https://lmstudio.ai/docs/developer/rest/chat).
+
+## Лицензия
+
+Код MediaScribe распространяется по [лицензии MIT](LICENSE). Модели Whisper, pyannote и LM Studio загружаются отдельно; условия их использования указаны в соответствующих репозиториях моделей.
