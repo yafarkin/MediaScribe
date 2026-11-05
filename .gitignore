@@ -1,0 +1,17 @@
+.venv/
+.cache/
+models/
+__pycache__/
+*.pyc
+output/
+.env
+.DS_Store
+videos/
+audios/
+*.mp4
+*.mkv
+*.mov
+*.mp3
+*.wav
+*.aiff
+*.m4a
