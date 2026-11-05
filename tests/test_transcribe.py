@@ -13,6 +13,20 @@ import transcribe as app
 
 
 class TranscriptTests(unittest.TestCase):
+    def test_language_is_detected_automatically_by_default(self):
+        args = app.parser().parse_args(["lecture.wav"])
+        self.assertEqual(args.language, "auto")
+
+    def test_preflight_rejects_missing_llm_before_processing(self):
+        args = argparse.Namespace(reuse_transcript=True, slides=False, pptx=False, pdf=False,
+                                  speakers=False, output_language="ru", translation_model="missing",
+                                  summarize=False, slides_mode="heuristic", vision_model=None,
+                                  summary_model=None, lm_url="http://127.0.0.1:1234/v1",
+                                  context_length=32768)
+        with patch.object(app, "model_info", side_effect=RuntimeError("Модель missing не найдена")):
+            with self.assertRaisesRegex(RuntimeError, "не найдена"):
+                app.preflight(args)
+
     def test_summary_child_runs_after_transcript_and_inherits_progress_output(self):
         native_run = subprocess.run
         child_calls = []
@@ -27,12 +41,62 @@ class TranscriptTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0)
                 return native_run(command, *args, **kwargs)
             raw = {"segments": [{"start": 0, "end": 1, "text": "Тест.", "words": []}]}
-            with patch("sys.argv", ["transcribe.py", str(source), "--summarize", "--summary-model", "Local Model", "--summary-chunk-chars", "6000"]), patch.object(app, "preflight"), patch.object(app, "recognize", return_value=raw), patch.object(app.subprocess, "run", run):
+            argv = ["transcribe.py", str(source), "--summarize", "--summary-model", "Local Model",
+                    "--summary-chunk-chars", "6000", "--output-language", "en"]
+            translation = json.dumps([{"id": 0, "text": "Test."}])
+            with patch("sys.argv", argv), patch.object(app, "preflight"), \
+                    patch.object(app, "recognize", return_value=raw), patch.object(app.subprocess, "run", run), \
+                    patch.object(app, "load_model", return_value="Local Model"), \
+                    patch.object(app, "chat", return_value=translation) as translate:
                 app.main()
             self.assertEqual(len(child_calls), 1)
             self.assertEqual(child_calls[0][0], sys.executable)
             self.assertIn("Local Model", child_calls[0])
             self.assertIn("6000", child_calls[0])
+            self.assertEqual(child_calls[0][-2:], ["--output-language", "en"])
+            self.assertEqual(translate.call_args.args[1], "Local Model")
+            self.assertIn("Тест.", (source.with_suffix("") / "transcript-original.md").read_text())
+
+    def test_output_language_saves_original_and_translated_transcripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "lecture.wav"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=1", str(source)], check=True)
+            raw = {"language": "ru", "segments": [
+                {"start": 0, "end": 1, "text": "Исходная реплика.", "words": []}]}
+
+            def translate(url, model, messages, **kwargs):
+                self.assertEqual(model, "Translator")
+                self.assertIn("into en", messages[0]["content"])
+                items = json.loads(messages[1]["content"])
+                return json.dumps([{"id": item["id"], "text": "Original statement."} for item in items])
+
+            argv = ["transcribe.py", str(source), "--output-language", "en", "--translation-model", "Translator"]
+            with patch("sys.argv", argv), patch.object(app, "preflight"), \
+                    patch.object(app, "recognize", return_value=raw), \
+                    patch.object(app, "load_model", return_value="Translator"), patch.object(app, "chat", translate):
+                app.main()
+            folder = source.with_suffix("")
+            self.assertIn("Исходная реплика.", (folder / "transcript-original.md").read_text())
+            self.assertIn("Original statement.", (folder / "transcript.md").read_text())
+            original = json.loads((folder / "transcript-original.json").read_text())
+            translated = json.loads((folder / "transcript.json").read_text())
+            self.assertEqual(original[0]["text"], "Исходная реплика.")
+            self.assertEqual(translated[0]["text"], "Original statement.")
+            self.assertEqual(translated[0]["start"], original[0]["start"])
+            self.assertEqual(translated[0]["end"], original[0]["end"])
+            metadata = json.loads((folder / "raw-transcript.json").read_text())
+            self.assertEqual(metadata["language"], "ru")
+            self.assertEqual(metadata["output_language"], "en")
+            self.assertEqual(metadata["segments"][0]["text"], "Исходная реплика.")
+
+    def test_translation_rejects_changed_utterance_count(self):
+        args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", translation_model="test",
+                                  translation_max_tokens=100, translation_timeout=10,
+                                  translation_reasoning="off", translation_chunk_chars=1000)
+        items = [{"start": 0, "end": 1, "speaker": "Спикер 1", "text": "Текст"}]
+        with patch.object(app, "chat", return_value="[]"):
+            with self.assertRaisesRegex(RuntimeError, "число или порядок"):
+                app.translate_utterances(items, "en", args)
 
     def test_speaker_change_splits_whisper_segment_at_word(self):
         segments = [{"start": 0, "end": 4, "text": "Привет. Да.", "words": [

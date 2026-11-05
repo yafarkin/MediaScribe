@@ -77,7 +77,8 @@ def load_lecture(folder):
     if duration is None:
         last_speech = max((float(s["end"]) for s in speech), default=0)
         duration = last_speech if last_speech > slides[-1]["time"] else None
-    return Lecture(folder, title, source_name, raw.get("language"), slides, speech, groups, images, duration)
+    language = raw.get("output_language") or raw.get("language")
+    return Lecture(folder, title, source_name, language, slides, speech, groups, images, duration)
 
 
 def markdown_escape(text):

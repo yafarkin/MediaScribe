@@ -8,6 +8,10 @@ import urllib.request
 from urllib.parse import urlsplit
 
 
+class StreamInterruptedError(RuntimeError):
+    pass
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         raise RuntimeError("Перенаправление запроса LM Studio запрещено.")
@@ -48,6 +52,56 @@ def request_json(base_url, path, payload=None, timeout=600):
         return json.load(response)
 
 
+def model_info(base_url, model):
+    base = local_endpoint(base_url).removesuffix("/v1")
+    result = request_json(base, "/api/v1/models")
+    models = result.get("models", result.get("data", []))
+    for item in models:
+        if model in {item.get("key"), item.get("id")}:
+            return item
+    raise RuntimeError(f"Модель {model} не найдена в LM Studio.")
+
+
+def validate_context_length(info, model, context_length):
+    maximum = info.get("max_context_length")
+    if isinstance(maximum, int) and context_length > maximum:
+        raise ValueError(f"Контекст {context_length} превышает максимум {maximum} для модели {model}.")
+
+
+def model_context_length(base_url, model):
+    info = model_info(base_url, model)
+    contexts = [instance.get("config", {}).get("context_length")
+                for instance in info.get("loaded_instances", [])]
+    contexts = [value for value in contexts if isinstance(value, int) and value > 0]
+    return min(contexts) if contexts else None
+
+
+def load_model(base_url, model, context_length, timeout=600):
+    info = model_info(base_url, model)
+    validate_context_length(info, model, context_length)
+    instances = info.get("loaded_instances", [])
+    matching = [instance for instance in instances
+                if instance.get("config", {}).get("context_length") == context_length]
+    if matching:
+        return matching[0].get("id", model)
+    base = local_endpoint(base_url).removesuffix("/v1")
+    result = request_json(base, "/api/v1/models/load", {
+        "model": model, "context_length": context_length, "echo_load_config": True,
+    }, timeout=timeout)
+    actual = result.get("load_config", {}).get("context_length")
+    instance_id = result.get("instance_id")
+    if actual is None or instance_id is None:
+        info = model_info(base_url, model)
+        matching = [instance for instance in info.get("loaded_instances", [])
+                    if instance.get("config", {}).get("context_length") == context_length]
+        if matching:
+            actual = context_length
+            instance_id = matching[0].get("id")
+    if actual != context_length or not instance_id:
+        raise RuntimeError(f"LM Studio загрузила модель {model} с контекстом {actual}, ожидался {context_length}.")
+    return instance_id
+
+
 def iter_events(response):
     """Read SSE blocks, including comments and multiline data fields."""
     event, data = "", []
@@ -80,7 +134,7 @@ def request_stream(base_url, path, payload, timeout, on_event):
                 result = event["result"]
                 break
     if result is None:
-        raise RuntimeError("Поток LM Studio прерван до завершения ответа. Незавершённый конспект не сохранён.")
+        raise StreamInterruptedError("Поток LM Studio прерван до завершения ответа. Незавершённый ответ не сохранён.")
     return result
 
 
