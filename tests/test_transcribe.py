@@ -136,10 +136,12 @@ class TranscriptTests(unittest.TestCase):
             if len(source) == 3:
                 return "[]"
             return json.dumps([{"id": item["id"], "text": f"Перевод {item['id']}"} for item in source])
-        with patch.object(app, "chat", side_effect=translate) as chat:
+        with patch.object(app, "chat", side_effect=translate) as chat, patch("builtins.print") as output:
             result = app.translate_utterances(items, "ru", args)
         self.assertEqual([item["text"] for item in result], ["Перевод 0", "Перевод 1", "Перевод 2"])
         self.assertEqual(chat.call_count, 3)
+        messages = [call.args[0] for call in output.call_args_list]
+        self.assertTrue(any("изменила число или порядок" in message for message in messages))
 
     def test_translation_retries_single_utterance_after_invalid_json(self):
         args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", translation_model="test",
@@ -241,6 +243,34 @@ class TranscriptTests(unittest.TestCase):
             self.assertEqual(len(slides), 2)
             self.assertIn("100%", progress_output.getvalue())
             self.assertEqual(cv2.imread(str(Path(tmp) / slides[0]["path"])).shape[:2], (360, 640))
+
+    def test_slide_interval_and_speech_filters(self):
+        import cv2
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "lecture.avi"
+            writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"MJPG"), 10, (32, 24))
+            writer.write(np.zeros((24, 32, 3), dtype=np.uint8))
+            writer.release()
+            frame = np.zeros((24, 32, 3), dtype=np.uint8)
+            candidates = [(10, frame), (20, frame), (40, frame)]
+            speech = [{"start": 0, "end": 12, "text": "Голос."}]
+            cases = [
+                (["--min-slide-interval", "25"], [], [10, 40], "min_slide_interval"),
+                (["--require-speech", "--speech-window", "5"], speech, [10], "require_speech"),
+            ]
+            for options, segments, expected, filter_name in cases:
+                with self.subTest(filter=filter_name):
+                    destination = Path(tmp) / filter_name
+                    destination.mkdir()
+                    args = app.parser().parse_args([str(source), "--slides", *options])
+                    with patch.object(app, "slide_candidates", return_value=candidates), \
+                            patch.object(app, "heuristic_slide", return_value={"keep": True, "reason": "test"}), \
+                            redirect_stderr(io.StringIO()):
+                        slides = app.extract_slides(source, destination, segments, args)
+                    self.assertEqual([slide["time"] for slide in slides], expected)
+                    decisions = json.loads((destination / "slide-decisions.json").read_text())
+                    self.assertEqual(decisions[1]["filter"], filter_name)
 
     def test_real_ffmpeg_extraction_output_and_cache_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit online step. Inference itself is always offline."""
+"""Download local speech models for offline transcription."""
 import argparse
 import os
 import sys

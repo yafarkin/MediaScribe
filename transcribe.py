@@ -16,7 +16,9 @@ import sys
 import tempfile
 from urllib.parse import quote
 import wave
-from lmstudio import chat, load_model, local_endpoint, model_info, request_json, validate_context_length
+from config import PROVIDERS, parse_args
+from lmstudio import (API_KEY_ENV, PROVIDER_NAMES, chat, load_model, local_endpoint, model_info,
+                      provider_endpoint, validate_context_length, vision_chat)
 
 ROOT = Path(__file__).resolve().parent
 MLX_MODEL = "mlx-community/whisper-large-v3-mlx"
@@ -29,7 +31,7 @@ def backend_name():
 
 
 def configure_offline():
-    # Set before importing any model libraries. No inference service is used.
+    # Set before importing recognition libraries. Speech recognition stays offline.
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -136,6 +138,8 @@ def preflight(args):
         llm_models.append(args.vision_model)
     if args.summarize:
         llm_models.append(args.summary_model)
+    if getattr(args, "provider", "lmstudio") != "lmstudio":
+        return
     for model in dict.fromkeys(llm_models):
         info = model_info(args.lm_url, model)
         validate_context_length(info, model, args.context_length)
@@ -212,7 +216,10 @@ def translate_utterances(items, language, args):
             try:
                 response = chat(args.lm_url, args.translation_model, messages,
                                 max_tokens=args.translation_max_tokens, timeout=args.translation_timeout,
-                                reasoning=args.translation_reasoning)
+                                reasoning=args.translation_reasoning,
+                                provider=getattr(args, "provider", "lmstudio"),
+                                api_key_value=getattr(args, "api_key", None),
+                                context_length=getattr(args, "context_length", None))
                 if response.startswith("```"):
                     response = response.split("\n", 1)[1].rsplit("```", 1)[0].strip()
                 values = json.loads(response)
@@ -229,7 +236,9 @@ def translate_utterances(items, language, args):
         if len(batch) == 1:
             raise last_error
         middle = len(batch) // 2
-        print(f"Перевод: неполный ответ, разбиение на {middle} и {len(batch) - middle} реплик", flush=True)
+        reason = str(last_error)[:300]
+        print(f"Перевод: неполный или некорректный ответ ({reason}); "
+              f"разбиение на {middle} и {len(batch) - middle} реплик", flush=True)
         return translate_batch(batch[:middle]) + translate_batch(batch[middle:])
 
     batches = []
@@ -273,11 +282,8 @@ def vision_decision(current, previous, context, args):
     if previous is not None:
         content.append(image_part(previous))
     content.append(image_part(current))
-    result = request_json(args.lm_url, "/chat/completions", {
-        "model": args.vision_model, "temperature": 0, "max_tokens": 250,
-        "chat_template_kwargs": {"enable_thinking": False},
-        "messages": [{"role": "user", "content": content}]}, timeout=180)
-    text = result["choices"][0]["message"]["content"].strip()
+    text = vision_chat(args.lm_url, args.vision_model, content, provider=args.provider,
+                       api_key_value=args.api_key, max_tokens=args.vision_max_tokens)
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     decision = json.loads(text)
@@ -366,9 +372,18 @@ def extract_slides(source, destination, segments, args):
         for timestamp, frame in slide_candidates(source, args.sample_interval, args.scene_threshold, args.settle, progress):
             bar.set_postfix(time=stamp(timestamp), checked=len(decisions), saved=len(slides), refresh=True)
             context = " ".join(s["text"] for s in segments
-                               if s["end"] >= timestamp - 20 and s["start"] <= timestamp + 20)
-            decision = (vision_decision(frame, previous, context[:6000], args)
-                        if args.slides_mode == "vision" else heuristic_slide(frame))
+                               if s["end"] >= timestamp - args.speech_window
+                               and s["start"] <= timestamp + args.speech_window).strip()
+            if args.require_speech and not context:
+                decision = {"keep": False, "reason": f"Нет речи в пределах {args.speech_window:g} секунд.",
+                            "filter": "require_speech"}
+            else:
+                decision = (vision_decision(frame, previous, context[:6000], args)
+                            if args.slides_mode == "vision" else heuristic_slide(frame))
+                if (decision["keep"] and slides
+                        and timestamp - slides[-1]["time"] < args.min_slide_interval):
+                    decision = dict(decision, keep=False, filter="min_slide_interval",
+                                    reason=f"Меньше {args.min_slide_interval:g} секунд после предыдущего кадра.")
             decisions.append({"time": timestamp, **decision})
             bar.set_postfix(time=stamp(timestamp), checked=len(decisions), saved=len(slides) + int(decision["keep"]))
             if not decision["keep"]:
@@ -436,58 +451,66 @@ def markdown(title, utterance_list, slides, mode=None, timestamps="segment", par
 
 
 def parser():
-    p = argparse.ArgumentParser(description="MediaScribe: локальная транскрипция аудио/видео, конспект, PowerPoint, PDF и Obsidian.",
+    p = argparse.ArgumentParser(description="MediaScribe: транскрипция аудио/видео, конспект, PowerPoint, PDF и Obsidian.",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("file", type=Path, help="Исходный аудио- или видеофайл")
+    p.add_argument("--config", type=Path, help="JSON-конфигурация; по умолчанию config.json рядом со скриптом")
+    p.add_argument("--provider", choices=PROVIDERS, default="lmstudio", help="Провайдер перевода, слайдов и конспекта")
+    p.add_argument("--base-url", "--lm-url", dest="lm_url", default="http://127.0.0.1:1234/v1",
+                   help="Базовый URL выбранного провайдера")
+    p.add_argument("--api-key", help="Ключ API; безопаснее задать переменную окружения провайдера")
     p.add_argument("--output-root", type=Path, help="Родительская папка результата; по умолчанию рядом с исходником")
     p.add_argument("--language", choices=["ru", "en", "auto"], default="auto", help="Язык распознавания; auto определяет язык автоматически")
     p.add_argument("--output-language", help="Язык перевода транскрипции и конспекта, например ru, en или de")
-    p.add_argument("--translation-model", help="Текстовая модель LM Studio для перевода; по умолчанию используется --summary-model")
+    p.add_argument("--translation-model", help="Текстовая модель для перевода; по умолчанию используется --summary-model")
     p.add_argument("--translation-chunk-chars", type=int, default=6000, help="Примерный размер части транскрипции для перевода, символы")
     p.add_argument("--translation-max-tokens", type=int, default=4096, help="Лимит ответа модели на каждой части перевода")
     p.add_argument("--translation-timeout", type=float, default=600, help="Таймаут каждого запроса перевода, секунды")
-    p.add_argument("--translation-reasoning", choices=["off", "auto"], default="off", help="Режим thinking модели перевода")
+    p.add_argument("--translation-reasoning", choices=["off", "auto"], default="off", help="Режим thinking модели перевода в LM Studio")
     p.add_argument("--model", type=Path, help="Папка локальной модели Whisper")
     p.add_argument("--prompt", default="", help="Термины и имена для Whisper, без изменения расшифровки моделью LLM")
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu", help="Для faster-whisper и pyannote; MLX всегда использует Metal")
-    p.add_argument("--speakers", action="store_true", help="Определять нескольких говорящих через локальную pyannote")
+    p.add_argument("--speakers", action=argparse.BooleanOptionalAction, default=False, help="Определять нескольких говорящих через локальную pyannote")
     p.add_argument("--num-speakers", type=int, help="Известное число говорящих; требует --speakers")
     p.add_argument("--speaker-model", type=Path, help="Папка локальной модели pyannote")
-    p.add_argument("--slides", action="store_true", help="Найти и сохранить кадры со слайдами")
-    p.add_argument("--pptx", action="store_true", help="Собрать <имя видео>.pptx с речью в заметках; для нового запуска включает --slides")
-    p.add_argument("--pdf", action="store_true", help="Собрать <имя видео>.pdf: слайды и речь; для нового запуска включает --slides")
+    p.add_argument("--slides", action=argparse.BooleanOptionalAction, default=False, help="Найти и сохранить кадры со слайдами")
+    p.add_argument("--pptx", action=argparse.BooleanOptionalAction, default=False, help="Собрать <имя видео>.pptx с речью в заметках; для нового запуска включает --slides")
+    p.add_argument("--pdf", action=argparse.BooleanOptionalAction, default=False, help="Собрать <имя видео>.pdf: слайды и речь; для нового запуска включает --slides")
     p.add_argument("--pdf-font-file", type=Path, help="TTF-шрифт для PDF; по умолчанию локальный Arial или DejaVu Sans")
-    p.add_argument("--obsidian", action="store_true", help="Собрать папку obsidian с summary.md, presentation.md и кадрами")
-    p.add_argument("--slides-mode", choices=["heuristic", "vision"], default="heuristic", help="Отбор по геометрии либо дополнительная проверка через LM Studio")
-    p.add_argument("--vision-model", help="Идентификатор модели с поддержкой изображений в LM Studio")
-    p.add_argument("--lm-url", default="http://127.0.0.1:1234/v1", help="Локальный адрес LM Studio для перевода, слайдов и конспекта")
-    p.add_argument("--context-length", type=int, default=32768, help="Контекст для автоматической загрузки моделей LM Studio")
+    p.add_argument("--obsidian", action=argparse.BooleanOptionalAction, default=False, help="Собрать папку obsidian с summary.md, presentation.md и кадрами")
+    p.add_argument("--slides-mode", choices=["heuristic", "vision"], default="heuristic", help="Отбор по геометрии либо дополнительная проверка через выбранную модель")
+    p.add_argument("--vision-model", help="Идентификатор модели с поддержкой изображений")
+    p.add_argument("--vision-max-tokens", type=int, default=250, help="Лимит ответа модели при проверке одного кадра")
+    p.add_argument("--context-length", type=int, default=32768, help="Контекст модели и основа для размера частей конспекта")
     p.add_argument("--sample-interval", type=float, default=1.0, help="Интервал проверки кадров, секунды")
     p.add_argument("--scene-threshold", type=float, default=0.06, help="Порог изменения кадра от 0 до 1; меньше означает больше кандидатов")
     p.add_argument("--settle", type=float, default=1.5, help="Ожидание стабильного кадра после изменения, секунды")
-    p.add_argument("--reuse-transcript", action="store_true", help="Использовать raw-transcript.json вместо повторного распознавания")
+    p.add_argument("--min-slide-interval", type=float, default=0, help="Минимальный интервал между сохранёнными кадрами, секунды; 0 отключает ограничение")
+    p.add_argument("--require-speech", action=argparse.BooleanOptionalAction, default=False,
+                   help="Сохранять кадры только при наличии речи в соседнем окне времени")
+    p.add_argument("--speech-window", type=float, default=20, help="Окно поиска речи до и после кадра, секунды")
+    p.add_argument("--reuse-transcript", action=argparse.BooleanOptionalAction, default=False, help="Использовать raw-transcript.json вместо повторного распознавания")
     p.add_argument("--timestamps", choices=["segment", "start", "paragraph", "interval", "none"], default="segment",
                    help="Формат таймкодов Markdown; JSON всегда содержит исходное время")
     p.add_argument("--paragraph-seconds", type=float, default=45, help="Максимальная длительность объединённого абзаца")
     p.add_argument("--timestamp-interval", type=float, default=60, help="Минимальный интервал отметок для --timestamps interval")
-    p.add_argument("--summarize", action="store_true", help="После транскрипции создать summary.md через локальную LM Studio")
-    p.add_argument("--summary-model", help="Идентификатор текстовой модели LM Studio")
+    p.add_argument("--summarize", action=argparse.BooleanOptionalAction, default=False, help="После транскрипции создать summary.md")
+    p.add_argument("--summary-model", default="qwen/qwen3.5-9b", help="Идентификатор текстовой модели")
     p.add_argument("--summary-prompt-file", type=Path, default=ROOT / "summary-prompt.md", help="Свой полный промпт вместо встроенных профилей")
     p.add_argument("--summary-type", choices=["auto", "lecture", "tutorial", "review", "conversation", "meeting", "gameplay", "general"],
-                   default="auto", help="Формат видео для конспекта; auto определяет его через LM Studio")
+                   default="auto", help="Формат видео для конспекта; auto определяет его отдельным запросом")
     p.add_argument("--summary-chunk-chars", type=int, help="Размер части транскрипции для конспекта; по умолчанию подбирается под контекст модели")
     p.add_argument("--summary-max-tokens", type=int, help="Лимит ответа модели; по умолчанию подбирается под контекст модели")
-    p.add_argument("--summary-timeout", type=float, default=600, help="Таймаут ожидания данных LM Studio, секунды")
-    p.add_argument("--summary-reasoning", choices=["off", "auto"], default="off", help="Отключить thinking либо использовать настройку модели")
+    p.add_argument("--summary-timeout", type=float, default=600, help="Таймаут ожидания ответа, секунды")
+    p.add_argument("--summary-reasoning", choices=["off", "auto"], default="off", help="Режим thinking конспекта в LM Studio")
     return p
 
 
 def main():
-    p = parser()
     if len(sys.argv) == 1:
-        p.print_help()
+        parser().print_help()
         return
-    args = p.parse_args()
+    p, args = parse_args(parser, "transcribe")
     if args.context_length < 1:
         p.error("context-length должен быть положительным")
     if args.output_language:
@@ -497,7 +520,7 @@ def main():
             p.error("Для --output-language укажите --translation-model либо --summary-model")
         if args.translation_chunk_chars < 500 or args.translation_max_tokens < 1 or args.translation_timeout <= 0:
             p.error("Нужны translation-chunk-chars >= 500, translation-max-tokens > 0 и translation-timeout > 0")
-        local_endpoint(args.lm_url)
+        provider_endpoint(args.lm_url, args.provider)
     if args.summarize:
         if not args.summary_model:
             p.error("Для --summarize укажите --summary-model")
@@ -510,7 +533,7 @@ def main():
             p.error("Файл промпта конспекта не найден или пуст")
         if args.summary_prompt_file != (ROOT / "summary-prompt.md").resolve() and args.summary_type != "auto":
             p.error("--summary-type нельзя сочетать со своим --summary-prompt-file")
-        local_endpoint(args.lm_url)
+        provider_endpoint(args.lm_url, args.provider)
     exports_requested = args.pptx or args.pdf or args.obsidian
     if exports_requested and not args.reuse_transcript:
         args.slides = True
@@ -519,14 +542,16 @@ def main():
         find_font(args.pdf_font_file)
     if args.paragraph_seconds <= 0 or args.timestamp_interval <= 0:
         p.error("paragraph-seconds и timestamp-interval должны быть положительными")
-    if args.sample_interval <= 0 or args.settle < 0 or not 0 < args.scene_threshold < 1:
-        p.error("Нужны sample-interval > 0, settle >= 0 и 0 < scene-threshold < 1")
+    if (args.sample_interval <= 0 or args.settle < 0 or not 0 < args.scene_threshold < 1
+            or args.min_slide_interval < 0 or args.speech_window <= 0 or args.vision_max_tokens < 1):
+        p.error("Нужны sample-interval > 0, settle >= 0, 0 < scene-threshold < 1, "
+                "min-slide-interval >= 0, speech-window > 0 и vision-max-tokens > 0")
     if args.num_speakers is not None and (not args.speakers or args.num_speakers < 1):
         p.error("--num-speakers требует --speakers и положительное число")
     if args.slides and args.slides_mode == "vision":
         if not args.vision_model:
             p.error("Для vision укажите --vision-model")
-        local_endpoint(args.lm_url)
+        provider_endpoint(args.lm_url, args.provider)
     source = args.file.expanduser().resolve()
     if not source.is_file():
         p.error(f"Файл не найден: {source}")
@@ -608,17 +633,19 @@ def main():
             original_transcript = destination / "transcript-original.md"
             write_json(destination / "transcript-original.json", original_spoken)
             original_transcript.write_text(markdown(source.stem, original_spoken, [], **rendering), encoding="utf-8")
-            print(f"LM Studio: загрузка {args.translation_model} с контекстом {args.context_length}", flush=True)
+            print(f"{PROVIDER_NAMES[args.provider]}: модель {args.translation_model}, контекст {args.context_length}", flush=True)
             args.translation_model = load_model(args.lm_url, args.translation_model, args.context_length,
-                                                timeout=args.translation_timeout)
+                                                timeout=args.translation_timeout, provider=args.provider,
+                                                api_key_value=args.api_key)
             spoken = translate_utterances(original_spoken, args.output_language, args)
         write_json(destination / "transcript.json", spoken)
         transcript.write_text(markdown(source.stem, spoken, [], **rendering), encoding="utf-8")
         gc.collect()
         if args.slides and args.slides_mode == "vision":
-            print(f"LM Studio: загрузка {args.vision_model} с контекстом {args.context_length}", flush=True)
+            print(f"{PROVIDER_NAMES[args.provider]}: модель {args.vision_model}, контекст {args.context_length}", flush=True)
             args.vision_model = load_model(args.lm_url, args.vision_model, args.context_length,
-                                           timeout=args.summary_timeout)
+                                           timeout=args.summary_timeout, provider=args.provider,
+                                           api_key_value=args.api_key)
         slides = extract_slides(source, destination, raw["segments"], args) if args.slides else cached_slides
         mode = args.slides_mode if args.slides else None
         transcript.write_text(markdown(source.stem, spoken, slides, mode, **rendering), encoding="utf-8")
@@ -634,7 +661,8 @@ def main():
     if args.summarize:
         # A child process retains the CLI's live streaming progress and exit code.
         command = [sys.executable, str(ROOT / "summarize.py"), str(transcript),
-                   "--model", args.summary_model, "--lm-url", args.lm_url,
+                   "--config", str(args.config), "--provider", args.provider,
+                   "--model", args.summary_model, "--base-url", args.lm_url,
                    "--prompt-file", str(args.summary_prompt_file),
                    "--summary-type", args.summary_type,
                    "--context-length", str(args.context_length),
@@ -646,7 +674,11 @@ def main():
             command += ["--max-tokens", str(args.summary_max_tokens)]
         if args.output_language:
             command += ["--output-language", args.output_language]
-        result = subprocess.run(command)
+        environment = None
+        if args.api_key:
+            environment = os.environ.copy()
+            environment[API_KEY_ENV[args.provider]] = args.api_key
+        result = subprocess.run(command, env=environment)
         if result.returncode:
             raise RuntimeError(f"Конспектатор завершился с кодом {result.returncode}. Транскрипция сохранена: {transcript}")
     if args.obsidian:

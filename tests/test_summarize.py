@@ -260,6 +260,86 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(checkpoint["summary_type"], "gameplay")
             self.assertIn("GAMEPLAY, LET'S PLAY OR WALKTHROUGH PROFILE", checkpoint["prompt"])
 
+    def test_openai_uses_chat_completions_contract(self):
+        response = {"choices": [{"message": {"content": "Notes"}, "finish_reason": "stop"}]}
+        with patch.object(lmstudio, "request_json", return_value=response) as request:
+            result = lmstudio.chat("https://api.openai.com/v1", "gpt-test", [
+                {"role": "system", "content": "Instructions"},
+                {"role": "user", "content": "Source"},
+            ], provider="openai", api_key_value="secret")
+        self.assertEqual(result, "Notes")
+        base, endpoint, payload = request.call_args.args
+        self.assertEqual(base, "https://api.openai.com/v1")
+        self.assertEqual(endpoint, "/chat/completions")
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        self.assertEqual(request.call_args.kwargs["provider"], "openai")
+        self.assertEqual(request.call_args.kwargs["api_key_value"], "secret")
+
+    def test_ollama_sets_context_without_api_key(self):
+        response = {"choices": [{"message": {"content": "Notes"}, "finish_reason": "stop"}]}
+        with patch.object(lmstudio, "request_json", return_value=response) as request:
+            result = lmstudio.chat("http://127.0.0.1:11434/v1", "qwen-test", [],
+                                   provider="ollama", context_length=8192)
+        self.assertEqual(result, "Notes")
+        self.assertEqual(request.call_args.args[2]["options"], {"num_ctx": 8192})
+        self.assertIsNone(request.call_args.kwargs["api_key_value"])
+
+    def test_claude_uses_messages_api_and_separate_system_prompt(self):
+        response = {"content": [{"type": "text", "text": "Notes"}], "stop_reason": "end_turn"}
+        with patch.object(lmstudio, "request_json", return_value=response) as request:
+            result = lmstudio.chat("https://api.anthropic.com", "claude-test", [
+                {"role": "system", "content": "Instructions"},
+                {"role": "user", "content": "Source"},
+            ], provider="claude", api_key_value="secret")
+        self.assertEqual(result, "Notes")
+        base, endpoint, payload = request.call_args.args
+        self.assertEqual((base, endpoint), ("https://api.anthropic.com", "/v1/messages"))
+        self.assertEqual(payload["system"], "Instructions")
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "Source"}])
+
+    def test_external_truncated_responses_are_rejected(self):
+        openai_response = {"choices": [{"message": {"content": "Partial"}, "finish_reason": "length"}]}
+        claude_response = {"content": [{"type": "text", "text": "Partial"}], "stop_reason": "max_tokens"}
+        with patch.object(lmstudio, "request_json", return_value=openai_response):
+            with self.assertRaisesRegex(RuntimeError, "обрезан"):
+                lmstudio.chat("https://api.openai.com/v1", "test", [], provider="openai", api_key_value="secret")
+        with patch.object(lmstudio, "request_json", return_value=claude_response):
+            with self.assertRaisesRegex(RuntimeError, "обрезан"):
+                lmstudio.chat("https://api.anthropic.com", "test", [], provider="claude", api_key_value="secret")
+
+    def test_openai_vision_omits_lmstudio_specific_option(self):
+        response = {"choices": [{"message": {"content": '{"keep": true}'}, "finish_reason": "stop"}]}
+        content = [{"type": "text", "text": "Classify"}]
+        with patch.object(lmstudio, "request_json", return_value=response) as request:
+            self.assertEqual(lmstudio.vision_chat("https://api.openai.com/v1", "test", content,
+                                                  provider="openai", api_key_value="secret",
+                                                  max_tokens=123), '{"keep": true}')
+        self.assertNotIn("chat_template_kwargs", request.call_args.args[2])
+        self.assertEqual(request.call_args.args[2]["max_tokens"], 123)
+
+    def test_claude_vision_converts_data_url_to_base64_image(self):
+        response = {"content": [{"type": "text", "text": '{"keep": true}'}], "stop_reason": "end_turn"}
+        content = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc123"}}]
+        with patch.object(lmstudio, "request_json", return_value=response) as request:
+            lmstudio.vision_chat("https://api.anthropic.com", "test", content,
+                                 provider="claude", api_key_value="secret")
+        image = request.call_args.args[2]["messages"][0]["content"][0]
+        self.assertEqual(image["type"], "image")
+        self.assertEqual(image["source"], {"type": "base64", "media_type": "image/jpeg", "data": "abc123"})
+
+    def test_external_endpoints_require_https_and_local_providers_stay_local(self):
+        self.assertEqual(lmstudio.provider_endpoint("https://api.openai.com/v1", "openai"),
+                         "https://api.openai.com/v1")
+        for provider in ["openai", "claude"]:
+            with self.assertRaises(ValueError):
+                lmstudio.provider_endpoint("http://example.com", provider)
+        with self.assertRaises(ValueError):
+            lmstudio.provider_endpoint("https://example.com/v1", "ollama")
+
+    def test_environment_key_takes_precedence_over_config(self):
+        with patch.dict(lmstudio.os.environ, {"OPENAI_API_KEY": "from-env"}):
+            self.assertEqual(lmstudio.api_key("openai", "from-config"), "from-env")
+
 
 if __name__ == "__main__":
     unittest.main()

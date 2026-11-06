@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create study notes through a strictly local LM Studio server."""
+"""Create study notes through LM Studio, Ollama, OpenAI or Claude."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 import sys
 
-from lmstudio import StreamInterruptedError, chat, load_model, local_endpoint, request_json
+from config import PROVIDERS, parse_args
+from lmstudio import (PROVIDER_NAMES, StreamInterruptedError, chat, list_models, load_model,
+                      provider_endpoint)
 from transcribe import stamp, write_json
 
 DEFAULT_PROMPT = Path(__file__).with_name("summary-prompt.md")
@@ -88,13 +90,19 @@ def classification_samples(text, limit=6000):
                        for label, start in samples)
 
 
+def model_options(args):
+    return {"provider": getattr(args, "provider", "lmstudio"),
+            "api_key_value": getattr(args, "api_key", None),
+            "context_length": getattr(args, "context_length", None)}
+
+
 def classify_summary_type(text, args):
     classifier = (PROFILE_DIR / "classifier.md").read_text(encoding="utf-8-sig").strip()
     messages = [{"role": "system", "content": classifier},
                 {"role": "user", "content": "<transcript_samples>\n" +
                  classification_samples(text) + "\n</transcript_samples>"}]
     response = chat(args.lm_url, args.model, messages, max_tokens=min(256, args.max_tokens),
-                    timeout=args.timeout, reasoning=args.reasoning)
+                    timeout=args.timeout, reasoning=args.reasoning, **model_options(args))
     try:
         summary_type = json.loads(response).get("type")
     except (AttributeError, json.JSONDecodeError):
@@ -151,7 +159,7 @@ def summarize(text, language, prompt, args, checkpoint, progress=None, on_event=
             try:
                 result = chat(args.lm_url, args.model, messages,
                               max_tokens=args.max_tokens, timeout=args.timeout, reasoning=args.reasoning,
-                              on_event=on_event)
+                              on_event=on_event, **model_options(args))
                 break
             except StreamInterruptedError:
                 if attempt == 3:
@@ -189,7 +197,7 @@ class SummaryProgress:
     def __enter__(self):
         from tqdm import tqdm
         self.overall = tqdm(total=1, desc="Конспект", unit="этап", dynamic_ncols=True, position=0)
-        self.current = tqdm(desc="Ожидание LM Studio", unit="симв", dynamic_ncols=True, position=1, leave=False)
+        self.current = tqdm(desc="Ожидание ответа", unit="симв", dynamic_ncols=True, position=1, leave=False)
         return self
 
     def plan(self, total):
@@ -223,12 +231,15 @@ class SummaryProgress:
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Подробный конспект транскрипции через локальную LM Studio")
+    p = argparse.ArgumentParser(description="Подробный конспект транскрипции через выбранного LLM-провайдера")
     p.add_argument("file", nargs="?", type=Path, help="Транскрипция .md/.txt/.json или папка с transcript.md")
-    p.add_argument("--model", help="Идентификатор модели LM Studio; список доступен через --list-models")
-    p.add_argument("--list-models", action="store_true")
-    p.add_argument("--lm-url", default="http://127.0.0.1:1234/v1")
-    p.add_argument("--context-length", type=int, default=32768, help="Контекст для автоматической загрузки модели")
+    p.add_argument("--config", type=Path, help="JSON-конфигурация; по умолчанию config.json рядом со скриптом")
+    p.add_argument("--provider", choices=PROVIDERS, default="lmstudio")
+    p.add_argument("--base-url", "--lm-url", dest="lm_url", default="http://127.0.0.1:1234/v1")
+    p.add_argument("--api-key", help="Ключ API; безопаснее задать переменную окружения провайдера")
+    p.add_argument("--model", default="qwen/qwen3.5-9b", help="Идентификатор модели; список доступен через --list-models")
+    p.add_argument("--list-models", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--context-length", type=int, default=32768, help="Контекст модели и основа для размера частей")
     p.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT,
                    help="Свой полный промпт вместо встроенных базового и профилей")
     p.add_argument("--summary-type", choices=["auto", *SUMMARY_TYPES], default="auto",
@@ -238,21 +249,20 @@ def parser():
     p.add_argument("--chunk-chars", type=int, help="Размер части в символах; по умолчанию подбирается под контекст модели")
     p.add_argument("--max-tokens", type=int, help="Лимит ответа каждого запроса; по умолчанию подбирается под контекст модели")
     p.add_argument("--timeout", type=float, default=600, help="Таймаут каждого запроса, секунды")
-    p.add_argument("--reasoning", choices=["off", "auto"], default="off", help="Режим thinking; auto для моделей без переключателя reasoning")
-    p.add_argument("--force", action="store_true", help="Заменить существующий конспект и промежуточные заметки")
+    p.add_argument("--reasoning", choices=["off", "auto"], default="off", help="Режим thinking в LM Studio")
+    p.add_argument("--force", action=argparse.BooleanOptionalAction, default=False, help="Заменить существующий конспект и промежуточные заметки")
     return p
 
 
 def main():
-    p = parser()
-    args = p.parse_args()
-    local_endpoint(args.lm_url)
+    p, args = parse_args(parser, "summarize")
+    provider_endpoint(args.lm_url, args.provider)
     if args.list_models:
-        for model in request_json(args.lm_url, "/models")["data"]:
+        for model in list_models(args.lm_url, args.provider, args.api_key):
             print(model["id"])
         return
     if args.file is None or not args.model:
-        p.error("Укажите файл и --model, либо используйте --list-models")
+        p.error("Укажите файл и модель в config.json или через --model, либо используйте --list-models")
     if ((args.chunk_chars is not None and args.chunk_chars < 1000)
             or (args.max_tokens is not None and args.max_tokens < 1) or args.timeout <= 0
             or args.context_length < 1):
@@ -278,8 +288,9 @@ def main():
     if not args.force and (output.exists() or checkpoint.exists()):
         p.error(f"Результат уже существует: {output} или {checkpoint}. Задайте --output либо --force")
     output.parent.mkdir(parents=True, exist_ok=True)
-    print(f"LM Studio: загрузка {args.model} с контекстом {args.context_length}", flush=True)
-    args.model = load_model(args.lm_url, args.model, args.context_length, timeout=args.timeout)
+    print(f"{PROVIDER_NAMES[args.provider]}: модель {args.model}, контекст {args.context_length}", flush=True)
+    args.model = load_model(args.lm_url, args.model, args.context_length, timeout=args.timeout,
+                            provider=args.provider, api_key_value=args.api_key)
     context_length = args.context_length
     try:
         args.chunk_chars, args.max_tokens = fit_summary_context(
