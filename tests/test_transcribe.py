@@ -7,12 +7,38 @@ import tempfile
 import unittest
 import io
 from contextlib import redirect_stderr
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import transcribe as app
 
 
 class TranscriptTests(unittest.TestCase):
+    def recognition_args(self, tmp):
+        return argparse.Namespace(model=Path(tmp), language="auto", prompt="", device="cpu")
+
+    def assert_safe_decoding_options(self, kwargs):
+        self.assertEqual(kwargs["temperature"], (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))
+        self.assertFalse(kwargs["condition_on_previous_text"])
+
+    def test_mlx_decoding_does_not_reinforce_repetition_loops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = MagicMock()
+            module.transcribe.return_value = {"language": "en", "segments": []}
+            with patch.object(app, "backend_name", return_value="mlx"), \
+                    patch.dict(sys.modules, {"mlx_whisper": module}):
+                app.recognize(Path(tmp) / "audio.wav", self.recognition_args(tmp))
+            self.assert_safe_decoding_options(module.transcribe.call_args.kwargs)
+
+    def test_faster_decoding_does_not_reinforce_repetition_loops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = MagicMock()
+            instance = module.WhisperModel.return_value
+            instance.transcribe.return_value = (iter([]), MagicMock(language="en"))
+            with patch.object(app, "backend_name", return_value="faster"), \
+                    patch.dict(sys.modules, {"faster_whisper": module}):
+                app.recognize(Path(tmp) / "audio.wav", self.recognition_args(tmp))
+            self.assert_safe_decoding_options(instance.transcribe.call_args.kwargs)
+
     def test_language_is_detected_automatically_by_default(self):
         args = app.parser().parse_args(["lecture.wav"])
         self.assertEqual(args.language, "auto")

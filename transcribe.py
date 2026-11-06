@@ -77,8 +77,9 @@ def recognize(wav, args):
         result = mlx_whisper.transcribe(
             str(wav), path_or_hf_repo=str(model), language=language,
             task="transcribe", word_timestamps=True, verbose=False,
-            temperature=0, initial_prompt=args.prompt or None,
-            condition_on_previous_text=True,
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            initial_prompt=args.prompt or None,
+            condition_on_previous_text=False,
         )
         segments = result["segments"]
         detected = result.get("language", language)
@@ -90,7 +91,8 @@ def recognize(wav, args):
         iterator, info = model_instance.transcribe(
             str(wav), language=language, task="transcribe", beam_size=5,
             word_timestamps=True, initial_prompt=args.prompt or None,
-            condition_on_previous_text=True,
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            condition_on_previous_text=False,
         )
         segments = []
         for s in iterator:
