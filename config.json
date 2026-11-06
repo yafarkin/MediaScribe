@@ -8,7 +8,7 @@
     "speaker": null,
     "translation": null,
     "summary": "qwen/qwen3.5-9b",
-    "vision": "qwen/qwen3-vl-4b"
+    "vision": "qwen/qwen3.5-9b"
   },
   "transcription": {
     "language": "auto",
@@ -19,13 +19,13 @@
     "reuse_transcript": false
   },
   "translation": {
-    "output_language": "ru",
     "chunk_chars": null,
     "max_tokens": null,
     "timeout": 600,
     "reasoning": "off"
   },
   "text": {
+    "output_language": "ru",
     "timestamps": "segment",
     "paragraph_seconds": 45,
     "timestamp_interval": 60
@@ -50,11 +50,10 @@
     "summary_file": null
   },
   "summary": {
-    "enabled": false,
+    "enabled": true,
     "list_models": false,
     "prompt_file": "summary-prompt.md",
     "type": "auto",
-    "output_language": "ru",
     "chunk_chars": null,
     "max_tokens": null,
     "timeout": 600,

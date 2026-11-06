@@ -68,9 +68,9 @@ def split_text(text, limit):
 def fit_summary_context(context_length, chunk_chars=None, max_tokens=None):
     if context_length is None:
         return chunk_chars or 4000, max_tokens or 2048
-    desired_output = min(4096, max(1024, context_length // 3 // 256 * 256))
+    desired_output = min(8192, max(1024, context_length // 3 // 256 * 256))
     if chunk_chars is None:
-        chunk_chars = min(10000, max(1000, context_length - desired_output - 2048))
+        chunk_chars = min(32000, max(1000, context_length - desired_output - 2048))
     available_output = context_length - chunk_chars - 2048
     if max_tokens is None:
         if available_output < 256:

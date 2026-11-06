@@ -97,7 +97,7 @@ class TranscriptTests(unittest.TestCase):
                 items = json.loads(messages[1]["content"])
                 return json.dumps([{"id": item["id"], "text": "Original statement."} for item in items])
 
-            argv = ["transcribe.py", str(source), "--no-speakers", "--output-language", "en", "--translation-model", "Translator"]
+            argv = ["transcribe.py", str(source), "--no-speakers", "--no-summarize", "--output-language", "en", "--translation-model", "Translator"]
             with patch("sys.argv", argv), patch.object(app, "preflight"), \
                     patch.object(app, "recognize", return_value=raw), \
                     patch.object(app, "load_model", return_value="Translator"), patch.object(app, "chat", translate):
@@ -116,13 +116,30 @@ class TranscriptTests(unittest.TestCase):
             self.assertEqual(metadata["output_language"], "en")
             self.assertEqual(metadata["segments"][0]["text"], "Исходная реплика.")
 
+    def test_same_output_language_skips_translation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "lecture.wav"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=1", str(source)], check=True)
+            raw = {"language": "ru", "segments": [
+                {"start": 0, "end": 1, "text": "Исходная реплика.", "words": []}]}
+            argv = ["transcribe.py", str(source), "--no-speakers", "--no-summarize", "--output-language", "ru"]
+            with patch("sys.argv", argv), patch.object(app, "recognize", return_value=raw), \
+                    patch.object(app, "load_model", side_effect=AssertionError("не нужна загрузка")), \
+                    patch.object(app, "chat", side_effect=AssertionError("не нужен перевод")):
+                app.main()
+            folder = source.with_suffix("")
+            self.assertIn("Исходная реплика.", (folder / "transcript.md").read_text())
+            self.assertFalse((folder / "transcript-original.md").exists())
+            metadata = json.loads((folder / "raw-transcript.json").read_text())
+            self.assertIsNone(metadata["output_language"])
+
     def test_translation_rejects_changed_utterance_count(self):
         args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", translation_model="test",
                                   translation_max_tokens=100, translation_timeout=10,
                                   translation_reasoning="off", translation_chunk_chars=1000)
         items = [{"start": 0, "end": 1, "speaker": "Спикер 1", "text": "Текст"}]
         with patch.object(app, "chat", return_value="[]"):
-            with self.assertRaisesRegex(RuntimeError, "число или порядок"):
+            with self.assertRaisesRegex(RuntimeError, "порядок"):
                 app.translate_utterances(items, "en", args)
 
     def test_translation_splits_incomplete_batch_and_preserves_order(self):
@@ -141,7 +158,20 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual([item["text"] for item in result], ["Перевод 0", "Перевод 1", "Перевод 2"])
         self.assertEqual(chat.call_count, 4)
         messages = [call.args[0] for call in output.call_args_list]
-        self.assertTrue(any("изменила число или порядок" in message for message in messages))
+        self.assertTrue(any("изменила порядок" in message for message in messages))
+
+    def test_translation_keeps_valid_prefix_and_requests_only_remainder(self):
+        args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", translation_model="test",
+                                  translation_max_tokens=100, translation_timeout=10,
+                                  translation_reasoning="off", translation_chunk_chars=1000)
+        items = [{"start": i, "end": i + 1, "speaker": "", "text": f"Text {i}"} for i in range(5)]
+        responses = [json.dumps([{"id": i, "text": f"Перевод {i}"} for i in range(3)]),
+                     json.dumps([{"id": i, "text": f"Перевод {i}"} for i in range(3, 5)])]
+        with patch.object(app, "chat", side_effect=responses) as chat, patch("builtins.print"):
+            result = app.translate_utterances(items, "ru", args)
+        self.assertEqual([item["text"] for item in result], [f"Перевод {i}" for i in range(5)])
+        second_batch = json.loads(chat.call_args_list[1].args[2][1]["content"])
+        self.assertEqual([item["id"] for item in second_batch], [3, 4])
 
     def test_translation_retries_single_utterance_after_invalid_json(self):
         args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", translation_model="test",
@@ -155,7 +185,7 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(chat.call_count, 2)
 
     def test_translation_auto_settings_fit_model_context(self):
-        self.assertEqual(app.fit_translation_context(131072), (12000, 8192))
+        self.assertEqual(app.fit_translation_context(131072), (32000, 8192))
         self.assertEqual(app.fit_translation_context(8192), (2048, 2048))
         self.assertEqual(app.fit_translation_context(32768, 5000, 6000), (5000, 6000))
 
@@ -310,7 +340,7 @@ class TranscriptTests(unittest.TestCase):
             def recognize(wav, args):
                 self.assertTrue(wav.is_file())
                 return {"language": "ru", "segments": [{"start": 0, "end": 1, "text": "Пример.", "words": []}]}
-            with patch("sys.argv", ["transcribe.py", str(source), "--no-speakers", "--output-language", ""]), patch.object(app, "recognize", recognize), patch.object(app, "preflight"):
+            with patch("sys.argv", ["transcribe.py", str(source), "--no-speakers", "--no-summarize", "--output-language", ""]), patch.object(app, "recognize", recognize), patch.object(app, "preflight"):
                 app.main()
             folder = source.with_suffix("")
             self.assertIn("Пример.", (folder / "transcript.md").read_text())
@@ -318,18 +348,18 @@ class TranscriptTests(unittest.TestCase):
             (folder / "slides" / "a.jpg").write_bytes(b"cached-jpg")
             app.write_json(folder / "slides.json", [{"time": 0, "path": "slides/a.jpg"}])
             app.write_json(folder / "speakers.json", [{"start": 0, "end": 1, "speaker": "a"}])
-            with patch("sys.argv", ["transcribe.py", str(source), "--reuse-transcript", "--no-speakers", "--output-language", ""]), patch.object(app, "recognize", side_effect=AssertionError):
+            with patch("sys.argv", ["transcribe.py", str(source), "--reuse-transcript", "--no-speakers", "--no-summarize", "--output-language", ""]), patch.object(app, "recognize", side_effect=AssertionError):
                 app.main()
             self.assertEqual(len(list((folder / "runs").glob("*/transcript.md"))), 1)
             repeated = next((folder / "runs").glob("*/transcript.md")).parent
             self.assertEqual((repeated / "slides" / "a.jpg").read_bytes(), b"cached-jpg")
             self.assertIn("slides/a.jpg", (repeated / "transcript.md").read_text())
             self.assertEqual(json.loads((repeated / "speakers.json").read_text())[0]["speaker"], "a")
-            with patch("sys.argv", ["transcribe.py", str(source), "--no-speakers", "--output-language", ""]), patch.object(app, "preflight"):
+            with patch("sys.argv", ["transcribe.py", str(source), "--no-speakers", "--no-summarize", "--output-language", ""]), patch.object(app, "preflight"):
                 with self.assertRaises(FileExistsError):
                     app.main()
             source.touch()
-            with patch("sys.argv", ["transcribe.py", str(source), "--reuse-transcript", "--no-speakers", "--output-language", ""]):
+            with patch("sys.argv", ["transcribe.py", str(source), "--reuse-transcript", "--no-speakers", "--no-summarize", "--output-language", ""]):
                 with self.assertRaisesRegex(RuntimeError, "исходнику"):
                     app.main()
 

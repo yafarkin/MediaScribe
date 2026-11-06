@@ -132,7 +132,7 @@ def preflight(args):
             file = "requirements-speakers.txt" if args.speakers else "requirements.txt"
             raise RuntimeError(f"Не установлен {module}. Выполните python -m pip install -r {file}")
     llm_models = []
-    if args.output_language:
+    if args.output_language and not getattr(args, "skip_translation", False):
         llm_models.append(args.translation_model)
     if args.slides and args.slides_mode == "vision":
         llm_models.append(args.vision_model)
@@ -147,22 +147,55 @@ def preflight(args):
 
 
 def diarize(wav, args):
+    import warnings
+    print("Разделение голосов: подготовка библиотек", flush=True)
     import torch
     import wave
     import numpy as np
-    from pyannote.audio import Pipeline
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="(?s).*torchcodec is not installed correctly.*")
+        from pyannote.audio import Pipeline
+    from tqdm import tqdm
     model = Path(args.speaker_model or ROOT / "models" / "speakers").resolve()
     if not model.is_dir():
         raise RuntimeError("Нет модели голосов. Запустите prepare.py --speakers.")
+    print("Разделение голосов: загрузка локальной модели", flush=True)
     pipeline = Pipeline.from_pretrained(str(model))
     if args.device == "cuda":
         pipeline.to(torch.device("cuda"))
+    print("Разделение голосов: подготовка звука", flush=True)
     # Pass waveform directly: no dependency on torchcodec's FFmpeg discovery.
     with wave.open(str(wav), "rb") as stream:
         samples = np.frombuffer(stream.readframes(stream.getnframes()), dtype=np.int16).copy()
     waveform = torch.from_numpy(samples.astype(np.float32) / 32768).unsqueeze(0)
     kwargs = {"num_speakers": args.num_speakers} if args.num_speakers else {}
-    output = pipeline({"waveform": waveform, "sample_rate": 16000}, **kwargs)
+    current = {"name": None, "bar": None}
+    labels = {"segmentation": "Анализ речи", "embeddings": "Признаки голосов",
+              "speaker_counting": "Число говорящих", "discrete_diarization": "Разметка говорящих"}
+
+    def progress(step_name, artefact, **details):
+        completed, total = details.get("completed"), details.get("total")
+        if completed is None or total is None:
+            return
+        if current["name"] != step_name:
+            if current["bar"] is not None:
+                current["bar"].close()
+            current["name"] = step_name
+            current["bar"] = tqdm(total=total, desc=f"Разделение голосов: {labels.get(step_name, step_name)}",
+                                  unit="фрагмент", dynamic_ncols=True)
+        current["bar"].total = total
+        current["bar"].update(completed - current["bar"].n)
+        current["bar"].refresh()
+
+    print("Разделение голосов: анализ записи", flush=True)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="std\\(\\): degrees of freedom.*")
+            output = pipeline({"waveform": waveform, "sample_rate": 16000}, hook=progress, **kwargs)
+    finally:
+        if current["bar"] is not None:
+            current["bar"].close()
+    print("Разделение голосов: готово", flush=True)
     return [{"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
             for turn, _, speaker in output.exclusive_speaker_diarization.itertracks(yield_label=True)]
 
@@ -209,7 +242,7 @@ def fit_translation_context(context_length, chunk_chars=None, max_tokens=None):
         return chunk_chars or 6000, max_tokens or 4096
     desired_output = min(8192, max(1024, context_length // 4 // 256 * 256))
     if chunk_chars is None:
-        chunk_chars = min(12000, max(1000, context_length - desired_output - 4096))
+        chunk_chars = min(32000, max(1000, context_length - desired_output - 4096))
     if max_tokens is None:
         available_output = context_length - chunk_chars - 4096
         if available_output < 256:
@@ -253,14 +286,26 @@ def translate_utterances(items, language, args):
                     response = response.split("\n", 1)[1].rsplit("```", 1)[0].strip()
                 values = json.loads(response)
                 if (not isinstance(values, list)
-                        or [value.get("id") if isinstance(value, dict) else None for value in values] != batch
-                        or any(not isinstance(value.get("text"), str) or not value["text"].strip()
-                               for value in values if isinstance(value, dict))):
-                    raise RuntimeError("Модель перевода изменила число или порядок реплик либо вернула пустой текст.")
-                learned["items"] = len(batch) if learned["items"] is None else max(learned["items"], len(batch))
-                chars = batch_chars(batch)
+                        or any(not isinstance(value, dict) or not isinstance(value.get("text"), str)
+                               or not value["text"].strip() for value in values)):
+                    raise RuntimeError("Модель перевода вернула неправильную структуру или пустой текст.")
+                if any("id" not in value for value in values):
+                    raise RuntimeError("Модель перевода вернула реплику без id.")
+                ids = [value["id"] for value in values]
+                translated_part = [dict(items[value["id"]], text=value["text"].strip())
+                                   for value in values if value["id"] in batch]
+                if len(translated_part) != len(values):
+                    raise RuntimeError("Модель перевода вернула неизвестный id.")
+                if ids != batch and not (values and ids == batch[:len(values)]):
+                    raise RuntimeError("Модель перевода изменила порядок реплик или пропустила часть середины.")
+                learned["items"] = len(values) if learned["items"] is None else max(learned["items"], len(values))
+                chars = batch_chars(batch[:len(values)])
                 learned["chars"] = chars if learned["chars"] is None else max(learned["chars"], chars)
-                return [dict(items[value["id"]], text=value["text"].strip()) for value in values]
+                if ids != batch:
+                    print(f"Перевод: получено {len(values)} из {len(batch)} реплик; "
+                          f"запрашиваю оставшиеся {len(batch) - len(values)}", flush=True)
+                    return translated_part + translate_batch(batch[len(values):])
+                return translated_part
             except (json.JSONDecodeError, IndexError) as error:
                 last_error = RuntimeError("Модель перевода не вернула JSON-массив.")
             except RuntimeError as error:
@@ -546,10 +591,17 @@ def main():
         parser().print_help()
         return
     p, args = parse_args(parser, "transcribe")
+    args.skip_translation = False
     if args.context_length < 1:
         p.error("context-length должен быть положительным")
     if args.output_language:
         args.output_language = args.output_language.strip()
+        if args.reuse_transcript:
+            cached_source = args.file.expanduser().resolve()
+            cached_raw = cached_source.parent / cached_source.stem / "raw-transcript.json"
+            if cached_raw.is_file():
+                cached_language = (json.loads(cached_raw.read_text(encoding="utf-8")).get("language") or "").lower()
+                args.skip_translation = cached_language == args.output_language.lower()
         args.translation_model = args.translation_model or args.summary_model
         if not args.translation_model:
             p.error("Для --output-language укажите --translation-model либо --summary-model")
@@ -560,8 +612,9 @@ def main():
                 args.context_length, args.translation_chunk_chars, args.translation_max_tokens)
         except ValueError as error:
             p.error(str(error))
-        print(f"Перевод: часть до {args.translation_chunk_chars} символов, "
-              f"ответ до {args.translation_max_tokens} токенов", flush=True)
+        if not args.skip_translation:
+            print(f"Перевод: часть до {args.translation_chunk_chars} символов, "
+                  f"ответ до {args.translation_max_tokens} токенов", flush=True)
         provider_endpoint(args.lm_url, args.provider)
     if args.summarize:
         if not args.summary_model:
@@ -660,7 +713,9 @@ def main():
         duration = info.get("format", {}).get("duration")
         if duration is not None:
             raw["duration"] = float(duration)
-        raw["output_language"] = args.output_language
+        source_language = (raw.get("language") or "").strip().lower()
+        translate = bool(args.output_language and args.output_language.strip().lower() != source_language)
+        raw["output_language"] = args.output_language if translate else None
         write_json(destination / "raw-transcript.json", raw)
         turns = diarize(wav, args) if args.speakers else cached_turns
         if turns is not None:
@@ -671,7 +726,7 @@ def main():
         original_transcript = None
         rendering = dict(timestamps=args.timestamps, paragraph_seconds=args.paragraph_seconds,
                          timestamp_interval=args.timestamp_interval)
-        if args.output_language:
+        if translate:
             original_transcript = destination / "transcript-original.md"
             write_json(destination / "transcript-original.json", original_spoken)
             original_transcript.write_text(markdown(source.stem, original_spoken, [], **rendering), encoding="utf-8")
@@ -680,6 +735,8 @@ def main():
                                                 timeout=args.translation_timeout, provider=args.provider,
                                                 api_key_value=args.api_key)
             spoken = translate_utterances(original_spoken, args.output_language, args)
+        elif args.output_language:
+            print(f"Перевод не требуется: исходный язык уже {source_language}", flush=True)
         write_json(destination / "transcript.json", spoken)
         transcript.write_text(markdown(source.stem, spoken, [], **rendering), encoding="utf-8")
         gc.collect()

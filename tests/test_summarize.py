@@ -67,7 +67,8 @@ class SummaryTests(unittest.TestCase):
 
     def test_summary_settings_fit_loaded_model_context(self):
         self.assertEqual(app.fit_summary_context(8192), (3584, 2560))
-        self.assertEqual(app.fit_summary_context(32768), (10000, 4096))
+        self.assertEqual(app.fit_summary_context(32768), (22528, 8192))
+        self.assertEqual(app.fit_summary_context(131072), (32000, 8192))
         self.assertEqual(app.fit_summary_context(8192, 3000, 3000), (3000, 3000))
         with self.assertRaisesRegex(ValueError, "не помещаются"):
             app.fit_summary_context(8192, 10000, 4096)

@@ -34,13 +34,13 @@ SCHEMA = {
         "reuse_transcript": {"transcribe": "reuse_transcript"},
     },
     "translation": {
-        "output_language": {"transcribe": "output_language"},
         "chunk_chars": {"transcribe": "translation_chunk_chars"},
         "max_tokens": {"transcribe": "translation_max_tokens"},
         "timeout": {"transcribe": "translation_timeout"},
         "reasoning": {"transcribe": "translation_reasoning"},
     },
     "text": {
+        "output_language": dict.fromkeys(BOTH, "output_language"),
         "timestamps": {"transcribe": "timestamps"},
         "paragraph_seconds": {"transcribe": "paragraph_seconds"},
         "timestamp_interval": {"transcribe": "timestamp_interval"},
@@ -69,7 +69,6 @@ SCHEMA = {
         "list_models": {"summarize": "list_models"},
         "prompt_file": {"transcribe": "summary_prompt_file", "summarize": "prompt_file"},
         "type": dict.fromkeys(BOTH, "summary_type"),
-        "output_language": {"summarize": "output_language"},
         "chunk_chars": {"transcribe": "summary_chunk_chars", "summarize": "chunk_chars"},
         "max_tokens": {"transcribe": "summary_max_tokens", "summarize": "max_tokens"},
         "timeout": {"transcribe": "summary_timeout", "summarize": "timeout"},

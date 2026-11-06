@@ -48,6 +48,19 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(args.model, "qwen/qwen3.5-9b")
             self.assertEqual(args.summary_type, "review")
 
+    def test_text_language_is_shared_by_both_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text(json.dumps({"text": {"output_language": "en"}}))
+            _, transcribe_args = config.parse_args(transcribe.parser, "transcribe", [
+                "lecture.wav", "--config", str(path),
+            ])
+            _, summary_args = config.parse_args(summarize.parser, "summarize", [
+                "transcript.md", "--config", str(path),
+            ])
+            self.assertEqual(transcribe_args.output_language, "en")
+            self.assertEqual(summary_args.output_language, "en")
+
     def test_summary_main_uses_provider_and_model_from_config(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
