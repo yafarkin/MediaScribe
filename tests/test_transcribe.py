@@ -125,6 +125,33 @@ class TranscriptTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "число или порядок"):
                 app.translate_utterances(items, "en", args)
 
+    def test_translation_splits_incomplete_batch_and_preserves_order(self):
+        args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", translation_model="test",
+                                  translation_max_tokens=100, translation_timeout=10,
+                                  translation_reasoning="off", translation_chunk_chars=1000)
+        items = [{"start": i, "end": i + 1, "speaker": "Спикер 1", "text": f"Text {i}"}
+                 for i in range(3)]
+        def translate(url, model, messages, **kwargs):
+            source = json.loads(messages[1]["content"])
+            if len(source) == 3:
+                return "[]"
+            return json.dumps([{"id": item["id"], "text": f"Перевод {item['id']}"} for item in source])
+        with patch.object(app, "chat", side_effect=translate) as chat:
+            result = app.translate_utterances(items, "ru", args)
+        self.assertEqual([item["text"] for item in result], ["Перевод 0", "Перевод 1", "Перевод 2"])
+        self.assertEqual(chat.call_count, 3)
+
+    def test_translation_retries_single_utterance_after_invalid_json(self):
+        args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", translation_model="test",
+                                  translation_max_tokens=100, translation_timeout=10,
+                                  translation_reasoning="off", translation_chunk_chars=1000)
+        items = [{"start": 0, "end": 1, "speaker": "Спикер 1", "text": "Text"}]
+        responses = ["not json", json.dumps([{"id": 0, "text": "Текст"}])]
+        with patch.object(app, "chat", side_effect=responses) as chat:
+            result = app.translate_utterances(items, "ru", args)
+        self.assertEqual(result[0]["text"], "Текст")
+        self.assertEqual(chat.call_count, 2)
+
     def test_speaker_change_splits_whisper_segment_at_word(self):
         segments = [{"start": 0, "end": 4, "text": "Привет. Да.", "words": [
             {"start": 0, "end": 1, "word": " Привет."},
