@@ -44,12 +44,18 @@ class Lecture:
             (f"{speaker}: " if speaker else "") + text for speaker, text in self.replicas(index))
 
     def replicas(self, index):
-        """Label the first speaker and each change, resetting for each slide."""
+        """Join each speaker's consecutive segments, resetting for each slide."""
         previous = None
+        parts = []
         for segment in self.groups[index]:
             speaker = segment.get("speaker", "Спикер 1")
-            yield (speaker if speaker != previous else None), segment["text"].strip()
+            if speaker != previous and parts:
+                yield previous, " ".join(parts)
+                parts = []
+            parts.append(segment["text"].strip())
             previous = speaker
+        if parts:
+            yield previous, " ".join(parts)
 
 
 def load_lecture(folder):

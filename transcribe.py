@@ -458,7 +458,9 @@ def parser():
     p.add_argument("--timestamp-interval", type=float, default=60, help="Минимальный интервал отметок для --timestamps interval")
     p.add_argument("--summarize", action="store_true", help="После транскрипции создать summary.md через локальную LM Studio")
     p.add_argument("--summary-model", help="Идентификатор текстовой модели LM Studio")
-    p.add_argument("--summary-prompt-file", type=Path, default=ROOT / "summary-prompt.md", help="Файл промпта конспектатора")
+    p.add_argument("--summary-prompt-file", type=Path, default=ROOT / "summary-prompt.md", help="Свой полный промпт вместо встроенных профилей")
+    p.add_argument("--summary-type", choices=["auto", "lecture", "tutorial", "review", "conversation", "meeting", "gameplay", "general"],
+                   default="auto", help="Формат видео для конспекта; auto определяет его через LM Studio")
     p.add_argument("--summary-chunk-chars", type=int, help="Размер части транскрипции для конспекта; по умолчанию подбирается под контекст модели")
     p.add_argument("--summary-max-tokens", type=int, help="Лимит ответа модели; по умолчанию подбирается под контекст модели")
     p.add_argument("--summary-timeout", type=float, default=600, help="Таймаут ожидания данных LM Studio, секунды")
@@ -492,6 +494,8 @@ def main():
         args.summary_prompt_file = args.summary_prompt_file.expanduser().resolve()
         if not args.summary_prompt_file.is_file() or not args.summary_prompt_file.read_text(encoding="utf-8-sig").strip():
             p.error("Файл промпта конспекта не найден или пуст")
+        if args.summary_prompt_file != (ROOT / "summary-prompt.md").resolve() and args.summary_type != "auto":
+            p.error("--summary-type нельзя сочетать со своим --summary-prompt-file")
         local_endpoint(args.lm_url)
     exports_requested = args.pptx or args.pdf or args.obsidian
     if exports_requested and not args.reuse_transcript:
@@ -618,6 +622,7 @@ def main():
         command = [sys.executable, str(ROOT / "summarize.py"), str(transcript),
                    "--model", args.summary_model, "--lm-url", args.lm_url,
                    "--prompt-file", str(args.summary_prompt_file),
+                   "--summary-type", args.summary_type,
                    "--context-length", str(args.context_length),
                    "--timeout", str(args.summary_timeout),
                    "--reasoning", args.summary_reasoning]

@@ -215,6 +215,51 @@ class SummaryTests(unittest.TestCase):
             self.assertIn("reduce", stages)
             self.assertEqual(stages[-1], "final")
 
+    def test_classifier_uses_beginning_middle_and_end(self):
+        args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", model="test",
+                                  max_tokens=4096, timeout=60, reasoning="off")
+        text = "НАЧАЛО " + "а" * 4000 + " СЕРЕДИНА " + "б" * 4000 + " КОНЕЦ"
+        with patch.object(app, "chat", return_value='{"type":"review"}') as chat:
+            self.assertEqual(app.classify_summary_type(text, args), "review")
+        messages = chat.call_args.args[2]
+        self.assertEqual(chat.call_args.kwargs["max_tokens"], 256)
+        for marker in ["НАЧАЛО", "СЕРЕДИНА", "КОНЕЦ"]:
+            self.assertIn(marker, messages[1]["content"])
+
+    def test_invalid_or_uncertain_classification_uses_general_profile(self):
+        args = argparse.Namespace(lm_url="http://127.0.0.1:1234/v1", model="test",
+                                  max_tokens=4096, timeout=60, reasoning="off")
+        for response in ["not JSON", '{"type":"unknown"}', '{"type":"general"}']:
+            with self.subTest(response=response), patch.object(app, "chat", return_value=response):
+                self.assertEqual(app.classify_summary_type("Source", args), "general")
+
+    def test_manual_profile_skips_classifier_and_reaches_final_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "transcript.md"
+            source.write_text("Разбор игры с примерами.")
+            argv = ["summarize.py", str(source), "--model", "test", "--summary-type", "review"]
+            with patch("sys.argv", argv), patch.object(app, "load_model", return_value="test"), \
+                    patch.object(app, "classify_summary_type", side_effect=AssertionError("не нужен")), \
+                    patch.object(app, "chat", return_value="# Обзор\n\nКонкретный тезис.") as chat:
+                app.main()
+            self.assertIn("REVIEW, VIDEO ESSAY OR ANALYSIS PROFILE", chat.call_args.args[2][0]["content"])
+            checkpoint = json.loads(source.with_name("summary.parts.json").read_text())
+            self.assertEqual(checkpoint["summary_type"], "review")
+
+    def test_auto_profile_is_selected_and_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "transcript.md"
+            source.write_text("Материал для классификации.")
+            with patch("sys.argv", ["summarize.py", str(source), "--model", "test"]), \
+                    patch.object(app, "load_model", return_value="test"), \
+                    patch.object(app, "classify_summary_type", return_value="gameplay") as classify, \
+                    patch.object(app, "chat", return_value="# Прохождение"):
+                app.main()
+            classify.assert_called_once()
+            checkpoint = json.loads(source.with_name("summary.parts.json").read_text())
+            self.assertEqual(checkpoint["summary_type"], "gameplay")
+            self.assertIn("GAMEPLAY, LET'S PLAY OR WALKTHROUGH PROFILE", checkpoint["prompt"])
+
 
 if __name__ == "__main__":
     unittest.main()

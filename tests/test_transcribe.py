@@ -42,7 +42,7 @@ class TranscriptTests(unittest.TestCase):
                 return native_run(command, *args, **kwargs)
             raw = {"segments": [{"start": 0, "end": 1, "text": "Тест.", "words": []}]}
             argv = ["transcribe.py", str(source), "--summarize", "--summary-model", "Local Model",
-                    "--summary-chunk-chars", "6000", "--output-language", "en"]
+                    "--summary-type", "review", "--summary-chunk-chars", "6000", "--output-language", "en"]
             translation = json.dumps([{"id": 0, "text": "Test."}])
             with patch("sys.argv", argv), patch.object(app, "preflight"), \
                     patch.object(app, "recognize", return_value=raw), patch.object(app.subprocess, "run", run), \
@@ -53,6 +53,7 @@ class TranscriptTests(unittest.TestCase):
             self.assertEqual(child_calls[0][0], sys.executable)
             self.assertIn("Local Model", child_calls[0])
             self.assertIn("6000", child_calls[0])
+            self.assertEqual(child_calls[0][child_calls[0].index("--summary-type") + 1], "review")
             self.assertEqual(child_calls[0][-2:], ["--output-language", "en"])
             self.assertEqual(translate.call_args.args[1], "Local Model")
             self.assertIn("Тест.", (source.with_suffix("") / "transcript-original.md").read_text())

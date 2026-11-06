@@ -71,6 +71,8 @@ class ExportTests(unittest.TestCase):
             second = deck.slides[1].notes_slide.notes_text_frame.text
             self.assertEqual(first.count("Спикер 1:"), 2)
             self.assertEqual(second.count("Спикер 1:"), 1)
+            self.assertIn("Спикер 1: Фраза 0. Фраза 1.\n\nСпикер 2: Фраза 2. Фраза 3.", first)
+            self.assertNotIn("Фраза 0.\n\nФраза 1.", first)
             obsidian = export_obsidian(folder)
             markdown = (obsidian / "presentation.md").read_text()
             pdf = PdfReader(export_pdf(folder))
