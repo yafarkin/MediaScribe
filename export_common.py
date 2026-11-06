@@ -48,7 +48,7 @@ class Lecture:
         previous = None
         parts = []
         for segment in self.groups[index]:
-            speaker = segment.get("speaker", "Спикер 1")
+            speaker = segment.get("speaker", "")
             if speaker != previous and parts:
                 yield previous, " ".join(parts)
                 parts = []

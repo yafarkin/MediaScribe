@@ -178,7 +178,11 @@ def speaker_for(start, end, turns):
 
 
 def utterances(segments, turns=None):
-    """Keep Whisper segments; split at speaker changes using word timestamps."""
+    """Keep Whisper segments and add speaker labels only when diarization ran."""
+    if not turns:
+        return [{"start": float(segment["start"]), "end": float(segment["end"]),
+                 "speaker": "", "text": segment["text"].strip()}
+                for segment in segments if segment["text"].strip()]
     labels = {}
     output = []
     for segment in segments:
@@ -200,8 +204,33 @@ def utterances(segments, turns=None):
     return [dict(s, text=s["text"].strip()) for s in output if s["text"].strip()]
 
 
+def fit_translation_context(context_length, chunk_chars=None, max_tokens=None):
+    if context_length is None:
+        return chunk_chars or 6000, max_tokens or 4096
+    desired_output = min(8192, max(1024, context_length // 4 // 256 * 256))
+    if chunk_chars is None:
+        chunk_chars = min(12000, max(1000, context_length - desired_output - 4096))
+    if max_tokens is None:
+        available_output = context_length - chunk_chars - 4096
+        if available_output < 256:
+            raise ValueError("Контекст модели слишком мал для перевода. Уменьшите translation.chunk_chars.")
+        max_tokens = min(desired_output, available_output)
+    if chunk_chars < 500 or max_tokens < 1:
+        raise ValueError("Нужны translation.chunk_chars >= 500 и translation.max_tokens > 0.")
+    return chunk_chars, max_tokens
+
+
 def translate_utterances(items, language, args):
+    learned = {"items": None, "chars": None}
+
+    def batch_chars(batch):
+        return sum(len(items[index]["text"]) + 32 for index in batch)
+
     def translate_batch(batch):
+        if len(batch) > 1 and learned["items"] is not None and (
+                len(batch) > learned["items"] or batch_chars(batch) > learned["chars"]):
+            middle = len(batch) // 2
+            return translate_batch(batch[:middle]) + translate_batch(batch[middle:])
         source = [{"id": index, "text": items[index]["text"]} for index in batch]
         messages = [
             {"role": "system", "content": (
@@ -228,6 +257,9 @@ def translate_utterances(items, language, args):
                         or any(not isinstance(value.get("text"), str) or not value["text"].strip()
                                for value in values if isinstance(value, dict))):
                     raise RuntimeError("Модель перевода изменила число или порядок реплик либо вернула пустой текст.")
+                learned["items"] = len(batch) if learned["items"] is None else max(learned["items"], len(batch))
+                chars = batch_chars(batch)
+                learned["chars"] = chars if learned["chars"] is None else max(learned["chars"], chars)
                 return [dict(items[value["id"]], text=value["text"].strip()) for value in values]
             except (json.JSONDecodeError, IndexError) as error:
                 last_error = RuntimeError("Модель перевода не вернула JSON-массив.")
@@ -241,22 +273,25 @@ def translate_utterances(items, language, args):
               f"разбиение на {middle} и {len(batch) - middle} реплик", flush=True)
         return translate_batch(batch[:middle]) + translate_batch(batch[middle:])
 
-    batches = []
-    batch = []
-    size = 0
-    for index, item in enumerate(items):
-        item_size = len(item["text"]) + 32
-        if batch and size + item_size > args.translation_chunk_chars:
-            batches.append(batch)
-            batch, size = [], 0
-        batch.append(index)
-        size += item_size
-    if batch:
-        batches.append(batch)
     translated = []
-    for number, batch in enumerate(batches, 1):
-        print(f"Перевод: часть {number}/{len(batches)}", flush=True)
+    index = 0
+    number = 1
+    while index < len(items):
+        char_limit = min(args.translation_chunk_chars, learned["chars"] or args.translation_chunk_chars)
+        item_limit = learned["items"]
+        batch = []
+        size = 0
+        while index < len(items):
+            item_size = len(items[index]["text"]) + 32
+            if batch and (size + item_size > char_limit
+                          or (item_limit is not None and len(batch) >= item_limit)):
+                break
+            batch.append(index)
+            size += item_size
+            index += 1
+        print(f"Перевод: часть {number}, реплик: {len(batch)}", flush=True)
         translated.extend(translate_batch(batch))
+        number += 1
     return translated
 
 
@@ -442,7 +477,7 @@ def markdown(title, utterance_list, slides, mode=None, timestamps="segment", par
                 timing = f"[{stamp(time)}] "
                 last_timestamp = time
             speaker = item["speaker"]
-            label = f"{speaker}:" if speaker != previous_speaker else ""
+            label = f"{speaker}:" if speaker and speaker != previous_speaker else ""
             heading = (timing + label).strip()
             prefix = f"**{heading}** " if heading else ""
             lines += [prefix + text, ""]
@@ -463,8 +498,8 @@ def parser():
     p.add_argument("--language", choices=["ru", "en", "auto"], default="auto", help="Язык распознавания; auto определяет язык автоматически")
     p.add_argument("--output-language", help="Язык перевода транскрипции и конспекта, например ru, en или de")
     p.add_argument("--translation-model", help="Текстовая модель для перевода; по умолчанию используется --summary-model")
-    p.add_argument("--translation-chunk-chars", type=int, default=6000, help="Примерный размер части транскрипции для перевода, символы")
-    p.add_argument("--translation-max-tokens", type=int, default=4096, help="Лимит ответа модели на каждой части перевода")
+    p.add_argument("--translation-chunk-chars", type=int, help="Примерный размер части перевода; по умолчанию подбирается под контекст модели")
+    p.add_argument("--translation-max-tokens", type=int, help="Лимит ответа на часть перевода; по умолчанию подбирается под контекст модели")
     p.add_argument("--translation-timeout", type=float, default=600, help="Таймаут каждого запроса перевода, секунды")
     p.add_argument("--translation-reasoning", choices=["off", "auto"], default="off", help="Режим thinking модели перевода в LM Studio")
     p.add_argument("--model", type=Path, help="Папка локальной модели Whisper")
@@ -518,8 +553,15 @@ def main():
         args.translation_model = args.translation_model or args.summary_model
         if not args.translation_model:
             p.error("Для --output-language укажите --translation-model либо --summary-model")
-        if args.translation_chunk_chars < 500 or args.translation_max_tokens < 1 or args.translation_timeout <= 0:
-            p.error("Нужны translation-chunk-chars >= 500, translation-max-tokens > 0 и translation-timeout > 0")
+        if args.translation_timeout <= 0:
+            p.error("translation-timeout должен быть положительным")
+        try:
+            args.translation_chunk_chars, args.translation_max_tokens = fit_translation_context(
+                args.context_length, args.translation_chunk_chars, args.translation_max_tokens)
+        except ValueError as error:
+            p.error(str(error))
+        print(f"Перевод: часть до {args.translation_chunk_chars} символов, "
+              f"ответ до {args.translation_max_tokens} токенов", flush=True)
         provider_endpoint(args.lm_url, args.provider)
     if args.summarize:
         if not args.summary_model:
